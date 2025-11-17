@@ -66,6 +66,43 @@ void setup_rpm_system();
 class CoolantSenderConfig;
 void setup_coolant_system();
 
+// ADC with ESP-IDF calibration wrapper
+#include "esp_adc_cal.h"
+
+// Calibrate the ADC
+
+class CalibratedADC : public RepeatSensor<float> {
+ public:
+  int pin;
+  adc1_channel_t channel;
+  esp_adc_cal_characteristics_t cal;
+
+  CalibratedADC(int pin, int interval_ms)
+      : RepeatSensor<float>(interval_ms, [this]() {
+          uint32_t raw = analogRead(this->pin);
+          uint32_t mv = esp_adc_cal_raw_to_voltage(raw, &this->cal);
+          return float(mv) / 1000.0f;
+        }),
+        pin(pin) {
+
+    // Convert GPIO → ADC1 channel (Valid only for ADC1: pins 32–39)
+    channel = (adc1_channel_t)(pin - 32);
+
+    // Configure ADC width and attenuation
+    analogReadResolution(12);                 // 12-bit ADC
+    analogSetPinAttenuation(pin, ADC_11db);   // Full scale ≈ 3.3V
+
+    // Characterize using eFuse or default
+    esp_adc_cal_characterize(
+        ADC_UNIT_1,
+        ADC_ATTEN_DB_11,
+        ADC_WIDTH_BIT_12,
+        1100,         // default Vref if not in eFuse
+        &cal
+    );
+  }
+};
+
 // ============================================================================
 // COOLANT TEMPERATURE LOOKUP TABLES (PROGMEM — flash-optimized)
 // ============================================================================
@@ -271,10 +308,11 @@ struct DS18Entry {
   String name;            // user-friendly sensor name
   String sk_path;         // Signal K output path
 
-  DS18Entry()
-      : address_hex("0000000000000000"),
-        name("DS18B20 Sensor"),
-        sk_path("environment.unknown.temperature") {}
+  DS18Entry() {
+  address_hex = "";
+  name = "";
+  sk_path = "";
+  }
 };
 
 
@@ -289,7 +327,8 @@ class OneWireRegistry : public FileSystemSaveable {
   OneWireRegistry() : FileSystemSaveable("onewire") {}
 
   bool to_json(JsonObject& root) override {
-    JsonArray arr = root["sensors"].to<JsonArray>();
+   // JsonArray arr = root["sensors"].to<JsonArray>();
+   JsonArray arr = root.createNestedArray("sensors"); 
     for (auto& e : entries) {
       JsonObject o = arr.add<JsonObject>();
       o["address"] = e.address_hex;
@@ -307,7 +346,10 @@ class OneWireRegistry : public FileSystemSaveable {
 
     for (JsonObject o : arr) {
       DS18Entry e;
-      e.address_hex = o["address"] | "";
+      //e.address_hex = o["address"] | "";
+      if (o["address"].is<const char*>()) e.address_hex = o["address"].as<const char*>();
+else e.address_hex = "";
+      
       e.name        = o["name"]    | "";
       e.sk_path     = o["sk_path"] | "";
       entries.push_back(e);
@@ -421,22 +463,34 @@ void discover_onewire_devices() {
 }
 
 
+
 // ============================================================================
-// DS18B20 READER — produces °C
+// DS18B20 READER — staggered reads using DallasTemperature
+// Each sensor is read once per cycle; sensors are offset by 1s so that
+// at most one sensor performs a conversion at any second.
 // ============================================================================
 
 class DS18Reader : public RepeatSensor<float> {
  public:
   DeviceAddress rom;
+  uint32_t offset_ms = 0;
 
-  DS18Reader(DeviceAddress address, int interval_ms)
-      : RepeatSensor<float>(interval_ms, [this]() {
-          if (ds_bus == nullptr) return NAN;
-          ds_bus->requestTemperatures();
-          float c = ds_bus->getTempC(this->rom);
-          return (c == DEVICE_DISCONNECTED_C) ? NAN : c;
-        }) {
+  DS18Reader(DeviceAddress address, uint32_t interval_ms, uint32_t offset = 0)
+      : RepeatSensor<float>(interval_ms, [this]() { return this->do_read(); }),
+        offset_ms(offset) {
     memcpy(rom, address, 8);
+    // Schedule first read at offset (so sensors are staggered)
+    if (offset_ms > 0) {
+      event_loop()->onDelay(offset_ms, [this]() { this->do_read(); });
+    }
+  }
+
+  float do_read() {
+    if (ds_bus == nullptr) return NAN;
+    // Request temperature (this triggers conversion on the bus)
+    ds_bus->requestTemperatures();
+    float c = ds_bus->getTempC(this->rom);
+    return (c == DEVICE_DISCONNECTED_C) ? NAN : c;
   }
 };
 
@@ -450,7 +504,10 @@ class DS18Reader : public RepeatSensor<float> {
 // ============================================================================
 
 void setup_onewire_sensors() {
-  for (auto& entry : onewire_registry.entries) {
+  size_t total = onewire_registry.entries.size();
+  if (total == 0) return;
+  for (size_t idx = 0; idx < total; ++idx) {
+    auto& entry = onewire_registry.entries[idx];
 
     // Validate ROM
     if (entry.address_hex.length() != 16) {
@@ -465,8 +522,24 @@ void setup_onewire_sensors() {
       continue;
     }
 
-    // Create DS18B20 reader (°C)
-    auto reader = std::make_shared<DS18Reader>(rom, 1000);
+    // Ensure we have a valid Signal K path. If empty, assign a default
+    // path so SensESP does not register an empty key. Persist the change.
+    {
+      String sk = entry.sk_path;
+      sk.trim();
+      if (sk.length() == 0) {
+        String default_sk = String("environment.temp.unknown") + String(idx + 1);
+        entry.sk_path = default_sk;
+        onewire_registry.save();
+        debugW("OneWire entry %s had empty sk_path; assigned default %s",
+               entry.address_hex.c_str(), entry.sk_path.c_str());
+      }
+    }
+
+    // Create DS18B20 reader (°C) with stagger: one sensor read per second
+    uint32_t interval_ms = uint32_t(total * 1000); // each sensor read every total seconds
+    uint32_t offset_ms = uint32_t(idx * 1000);     // stagger reads by 1s per sensor
+    auto reader = std::make_shared<DS18Reader>(rom, interval_ms, offset_ms);
 
     // Convert °C → Kelvin
     auto to_kelvin = std::make_shared<CelsiusToKelvin>();
@@ -505,12 +578,10 @@ void setup_onewire_sensors() {
 void setup_coolant_system() {
 
   // 1) Raw ADC voltage
-  auto adc = std::make_shared<AnalogInput>(
+    auto adc = std::make_shared<CalibratedADC>(
       COOLANT_ADC_PIN,
-      2000,    // sampling interval
-      "",
-      3.3f     // scale 1:1
-  );
+      2000    // sampling interval
+    );
 
   // 2) Voltage → Resistance using known R1=220kΩ, R2=100kΩ
   auto v2r = std::make_shared<VoltageToResistance>();
@@ -518,7 +589,6 @@ void setup_coolant_system() {
 
   // 3) Resistance → Temperature °C based on sender type
   auto r2t = std::make_shared<ResistanceToTemperature>();
-  r2t->sender = coolant_sender_cfg.sender;
   ConfigItem(r2t)->set_title("Coolant Sender Type");
 
   // 4) °C → Kelvin
@@ -589,7 +659,6 @@ TachDebounceConfig tach_debounce_cfg;
 inline const String ConfigSchema(const TachDebounceConfig& obj) {
   return String("{\"type\":\"object\",\"properties\":{\"debounce_us\":{\"title\":\"RPM Debounce (microseconds)\",\"type\":\"number\"}}}");
 }
-
 
 // ============================================================================
 // ISR pulse counting
