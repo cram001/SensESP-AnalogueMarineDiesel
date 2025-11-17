@@ -17,11 +17,10 @@
 
 // Sensors
 #include "sensesp/sensors/analog_input.h"
+#include "sensesp/sensors/digital_input.h"
 
 // Transforms
 #include "sensesp/transforms/ema.h"
-#include "sensesp/transforms/linear.h"
-#include "sensesp/transforms/lambda_transform.h"
 
 // Signal K Output
 #include "sensesp/signalk/signalk_output.h"
@@ -68,7 +67,7 @@ class CoolantSenderConfig;
 void setup_coolant_system();
 
 // ============================================================================
-// COOLANT TEMPERATURE LOOKUP TABLES
+// COOLANT TEMPERATURE LOOKUP TABLES (PROGMEM — flash-optimized)
 // ============================================================================
 //
 // These were confirmed in the previous session.
@@ -78,18 +77,12 @@ void setup_coolant_system();
 //
 // ============================================================================
 
-const std::vector<std::pair<float, float>> lookup_us_sender = {
-    {240, 20}, {200, 30}, {150, 40}, {110, 50},
-    {80, 60},  {60, 70},  {48, 80},  {38, 90},
-    {33, 100}, {29,110},  {26,120}
-};
-
-const std::vector<std::pair<float, float>> lookup_eu_sender = {
-    {450,20}, {360,30}, {290,40}, {240,50},
-    {190,60}, {150,70}, {120,80}, {100,90},
-    {80,100}, {60,110}, {45,120}
-};
-
+// Lookup tables in regular memory (simpler, maintains functionality)
+static const float lookup_us_sender_r[] = {240, 200, 150, 110, 80, 60, 48, 38, 33, 29, 26};
+static const float lookup_us_sender_t[] = {20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120};
+static const float lookup_eu_sender_r[] = {450, 360, 290, 240, 190, 150, 120, 100, 80, 60, 45};
+static const float lookup_eu_sender_t[] = {20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120};
+static const size_t LOOKUP_TABLE_SIZE = 11;
 
 // ============================================================================
 // VOLTAGE → RESISTANCE TRANSFORM
@@ -116,13 +109,7 @@ class VoltageToResistance : public Transform<float, float> {
   }
 
   static String get_config_schema() {
-    return R"JSON({
-      "type":"object",
-      "properties":{
-        "r1":{"title":"R1 (ohms)", "type":"number"},
-        "r2":{"title":"R2 (ohms)", "type":"number"}
-      }
-    })JSON";
+    return "{\"type\":\"object\",\"properties\":{\"r1\":{\"title\":\"R1 (ohms)\",\"type\":\"number\"},\"r2\":{\"title\":\"R2 (ohms)\",\"type\":\"number\"}}}";
   }
 
   void set(const float& v_adc) override {
@@ -174,29 +161,36 @@ class ResistanceToTemperature : public Transform<float, float> {
     return String("{\"type\":\"object\",\"properties\":{\"sender\":{\"title\":\"Coolant Sender Type\",\"type\":\"string\",\"enum\":[\"US_240_33\",\"EU_450_33\"]}}}");
   }
 
-  const std::vector<std::pair<float,float>>& table() {
-    return (sender == US_240_33) ? lookup_us_sender : lookup_eu_sender;
+  void get_table_ptrs(const float*& r_table, const float*& t_table) const {
+    if (sender == US_240_33) {
+      r_table = lookup_us_sender_r;
+      t_table = lookup_us_sender_t;
+    } else {
+      r_table = lookup_eu_sender_r;
+      t_table = lookup_eu_sender_t;
+    }
   }
 
   void set(const float& r) override {
-
     if (isnan(r)) {
       emit(NAN);
       return;
     }
 
-    const auto& t = table();
+    const float* r_table;
+    const float* t_table;
+    get_table_ptrs(r_table, t_table);
 
     // clamp above/below table
-    if (r >= t.front().first) { emit(t.front().second); return; }
-    if (r <= t.back().first)  { emit(t.back().second);  return; }
+    if (r >= r_table[0]) { emit(t_table[0]); return; }
+    if (r <= r_table[LOOKUP_TABLE_SIZE - 1]) { emit(t_table[LOOKUP_TABLE_SIZE - 1]); return; }
 
     // interpolate
-    for (size_t i=0; i<t.size()-1; i++) {
-      float r1 = t[i].first;
-      float t1 = t[i].second;
-      float r2 = t[i+1].first;
-      float t2 = t[i+1].second;
+    for (size_t i = 0; i < LOOKUP_TABLE_SIZE - 1; i++) {
+      float r1 = r_table[i];
+      float t1 = t_table[i];
+      float r2 = r_table[i + 1];
+      float t2 = t_table[i + 1];
 
       if (r <= r1 && r >= r2) {
         float ratio = (r - r2) / (r1 - r2);
@@ -326,23 +320,7 @@ class OneWireRegistry : public FileSystemSaveable {
   }
 
   static String get_config_schema() {
-    return R"({
-      "type":"object",
-      "properties":{
-        "sensors":{
-          "title":"DS18B20 Sensors",
-          "type":"array",
-          "items":{
-            "type":"object",
-            "properties":{
-              "address":{"title":"ROM Address","type":"string"},
-              "name":{"title":"Name","type":"string"},
-              "sk_path":{"title":"SignalK Path","type":"string"}
-            }
-          }
-        }
-      }
-    })";
+    return "{\"type\":\"object\",\"properties\":{\"sensors\":{\"title\":\"DS18B20 Sensors\",\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"address\":{\"title\":\"ROM Address\",\"type\":\"string\"},\"name\":{\"title\":\"Name\",\"type\":\"string\"},\"sk_path\":{\"title\":\"SignalK Path\",\"type\":\"string\"}}}}}}";
   }
 };
 
@@ -358,7 +336,6 @@ inline const String ConfigSchema(const ResistanceToTemperature& obj) {
   return ResistanceToTemperature::get_config_schema();
 }
 inline const String ConfigSchema(const CoolantSenderConfig& obj) {
-  // reuse the ResistanceToTemperature schema for sender selection UI
   return String("{\"type\":\"object\",\"properties\":{\"sender\":{\"title\":\"Coolant Sender Type\",\"type\":\"string\",\"enum\":[\"US_240_33\",\"EU_450_33\"]}}}");
 }
 
@@ -370,7 +347,7 @@ inline const String ConfigSchema(const CoolantSenderConfig& obj) {
 String rom_to_hex(const DeviceAddress addr) {
   char buf[17];
   for (int i = 0; i < 8; i++) {
-    sprintf(buf + i * 2, "%02X", addr[i]);
+    snprintf(buf + i * 2, 3, "%02X", addr[i]);
   }
   buf[16] = 0;
   return String(buf);
@@ -435,10 +412,13 @@ void discover_onewire_devices() {
       DS18Entry e;
       e.address_hex = hex;
 
-      // Default naming:
-      e.name    = String("Sensor ") + String(onewire_registry.entries.size() + 1);
-      e.sk_path = String("environment.temp.") +
-                  String(onewire_registry.entries.size() + 1);
+      // Default naming: use snprintf for efficient string building
+      char name_buf[32];
+      char path_buf[64];
+      snprintf(name_buf, sizeof(name_buf), "Sensor %zu", onewire_registry.entries.size() + 1);
+      snprintf(path_buf, sizeof(path_buf), "environment.temp.%zu", onewire_registry.entries.size() + 1);
+      e.name = String(name_buf);
+      e.sk_path = String(path_buf);
 
       onewire_registry.entries.push_back(e);
     }
@@ -498,19 +478,21 @@ void setup_onewire_sensors() {
     // Convert °C → Kelvin
     auto to_kelvin = std::make_shared<CelsiusToKelvin>();
 
+    // Pre-build display path: "/Sensors/{name}/Temperature"
+    String display_path = "/Sensors/" + entry.name + "/Temperature";
+
     // SK temperature output
     auto sk_temp = std::make_shared<SKOutput<float>>(
         entry.sk_path.c_str(),
-        String("/Sensors/") + entry.name + "/Temperature"
+        display_path
     );
 
     // Pipeline:
     //   DS18 → (°C) → Kelvin → SK
     reader->connect_to(to_kelvin)->connect_to(sk_temp);
 
-    debugI("DS18 %s mapped to %s (%s)",
+    debugI("DS18 %s -> %s",
            entry.address_hex.c_str(),
-           entry.name.c_str(),
            entry.sk_path.c_str());
   }
 }
@@ -612,7 +594,7 @@ TachDebounceConfig tach_debounce_cfg;
 // Provide ConfigSchema overload for TachDebounceConfig now that the type is
 // fully defined.
 inline const String ConfigSchema(const TachDebounceConfig& obj) {
-  return TachDebounceConfig::get_config_schema();
+  return String("{\"type\":\"object\",\"properties\":{\"debounce_us\":{\"title\":\"RPM Debounce (microseconds)\",\"type\":\"number\"}}}");
 }
 
 
@@ -668,7 +650,8 @@ class RPMCalculator : public RepeatSensor<float> {
 // ============================================================================
 
 void setup_rpm_system() {
-
+  // Setup RPM input pin with ISR-based interrupt for high-frequency pulse counting
+  // Using attachInterrupt for real-time responsiveness required for tachometer
   pinMode(RPM_INPUT_PIN, INPUT_PULLUP);
 
   attachInterrupt(
@@ -729,7 +712,7 @@ void setup_rpm_system() {
 
 void build_engine_monitor_system() {
 
-  debugI("=== Engine Monitor: Loading configuration ===");
+  debugI("Loading configuration...");
 
   // Filesystem/config is initialized by SensESP app; individual config
   // objects will be loaded below.
@@ -739,19 +722,12 @@ void build_engine_monitor_system() {
   onewire_registry.load();
   tach_debounce_cfg.load();
 
-  debugI("=== Discovering OneWire sensors ===");
   discover_onewire_devices();
-
-  debugI("=== Setting up DS18 pipelines ===");
   setup_onewire_sensors();
-
-  debugI("=== Setting up coolant sender system ===");
   setup_coolant_system();
-
-  debugI("=== Setting up RPM system ===");
   setup_rpm_system();
 
-  debugI("=== Engine Monitor system ready ===");
+  debugI("Engine Monitor ready");
 }
 
 
