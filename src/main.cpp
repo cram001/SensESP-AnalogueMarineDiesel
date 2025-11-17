@@ -110,8 +110,8 @@ class VoltageToResistance : public Transform<float, float> {
   }
 
   bool from_json(const JsonObject& cfg) override {
-    if (cfg.containsKey("r1")) r1 = cfg["r1"];
-    if (cfg.containsKey("r2")) r2 = cfg["r2"];
+    if (cfg["r1"].is<float>()) r1 = cfg["r1"].as<float>();
+    if (cfg["r2"].is<float>()) r2 = cfg["r2"].as<float>();
     return true;
   }
 
@@ -164,8 +164,8 @@ class ResistanceToTemperature : public Transform<float, float> {
   }
 
   bool from_json(const JsonObject& cfg) override {
-    if (cfg.containsKey("sender")) {
-      sender = (SenderType)cfg["sender"];
+    if (cfg["sender"].is<int>()) {
+      sender = (SenderType)cfg["sender"].as<int>();
     }
     return true;
   }
@@ -242,8 +242,8 @@ class CoolantSenderConfig : public FileSystemSaveable {
   }
 
   bool from_json(const JsonObject& cfg) override {
-    if (cfg.containsKey("sender")) {
-      sender = (ResistanceToTemperature::SenderType)cfg["sender"];
+    if (cfg["sender"].is<int>()) {
+      sender = (ResistanceToTemperature::SenderType)cfg["sender"].as<int>();
     }
     return true;
   }
@@ -299,9 +299,9 @@ class OneWireRegistry : public FileSystemSaveable {
   OneWireRegistry() : FileSystemSaveable("onewire") {}
 
   bool to_json(JsonObject& root) override {
-    JsonArray arr = root.createNestedArray("sensors");
+    JsonArray arr = root["sensors"].to<JsonArray>();
     for (auto& e : entries) {
-      JsonObject o = arr.createNestedObject();
+      JsonObject o = arr.add<JsonObject>();
       o["address"] = e.address_hex;
       o["name"] = e.name;
       o["sk_path"] = e.sk_path;
@@ -310,10 +310,10 @@ class OneWireRegistry : public FileSystemSaveable {
   }
 
   bool from_json(const JsonObject& cfg) override {
-    if (!cfg.containsKey("sensors")) return true;
+    if (!cfg["sensors"].is<JsonArray>()) return true;
 
     entries.clear();
-    JsonArray arr = cfg["sensors"];
+    JsonArray arr = cfg["sensors"].as<JsonArray>();
 
     for (JsonObject o : arr) {
       DS18Entry e;
@@ -592,8 +592,8 @@ class TachDebounceConfig : public FileSystemSaveable {
   }
 
   bool from_json(const JsonObject& cfg) override {
-    if (cfg.containsKey("debounce_us")) {
-      debounce_us = cfg["debounce_us"];
+    if (cfg["debounce_us"].is<uint32_t>()) {
+      debounce_us = cfg["debounce_us"].as<uint32_t>();
 
       // safety limits
       if (debounce_us < 200) debounce_us = 200;

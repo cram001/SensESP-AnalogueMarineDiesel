@@ -19,7 +19,7 @@ class EMA : public Transform<float, float> {
   }
 
   bool from_json(const JsonObject& config) override {
-    if (config.containsKey("alpha")) alpha_ = config["alpha"];
+    if (config["alpha"].is<float>()) alpha_ = config["alpha"].as<float>();
     return true;
   }
 
