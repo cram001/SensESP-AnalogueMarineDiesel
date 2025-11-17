@@ -1,6 +1,6 @@
 //
 // ============================================================================
-// ENGINE MONITOR FIRMWARE — ESP32 + SensESP 3.x
+// ANALOGUE DIESEL ENGINE MONITOR FIRMWARE — ESP32 + SensESP 3.x
 // Supports:
 //   • 1 × Analog Coolant Temp Sender (Teleflex/Faria US 240–33Ω or EU 450–33Ω)
 //   • 1-Wire DS18B20 system (up to 3 sensors) with Web UI mapping
@@ -70,8 +70,6 @@ void setup_coolant_system();
 // COOLANT TEMPERATURE LOOKUP TABLES (PROGMEM — flash-optimized)
 // ============================================================================
 //
-// These were confirmed in the previous session.
-//
 //   US Sender (Teleflex/Faria): 240 → 33Ω
 //   EU Sender (VDO):            450 → 33Ω
 //
@@ -86,12 +84,12 @@ static const size_t LOOKUP_TABLE_SIZE = 11;
 
 // ============================================================================
 // VOLTAGE → RESISTANCE TRANSFORM
-// Using confirmed R1 = 220kΩ, R2 = 100kΩ
+// Voltage divider: R1 = 220kΩ, R2 = 100kΩ
 // ============================================================================
 
 class VoltageToResistance : public Transform<float, float> {
  public:
-  float r1 = 220000.0f;   // confirmed as correct for your circuit
+  float r1 = 220000.0f;   
   float r2 = 100000.0f;
 
   VoltageToResistance() : Transform<float, float>("volt2res") {}
@@ -218,7 +216,6 @@ class CelsiusToKelvin : public Transform<float, float> {
   }
 };
 
-
 // ============================================================================
 // COOLANT SENDER CONFIG (Persistent)
 // ============================================================================
@@ -248,8 +245,8 @@ CoolantSenderConfig coolant_sender_cfg;
 // SECTION 2 — DS18B20 SENSOR REGISTRY + DISCOVERY + READER
 // ============================================================================
 //
-// Supports up to MAX_DS18 sensors.
-// Stored in /config/onewire.json:
+// Supports up to 3 DS18B20 sensors.
+// SignalK config stored in /config/onewire.json:
 //
 //  {
 //    "sensors":[
@@ -264,7 +261,6 @@ CoolantSenderConfig coolant_sender_cfg;
 //
 // The registry is edited through the SensESP Web UI.
 // ============================================================================
-
 
 // ============================================================================
 // Sensor registry entry
@@ -339,7 +335,6 @@ inline const String ConfigSchema(const CoolantSenderConfig& obj) {
   return String("{\"type\":\"object\",\"properties\":{\"sender\":{\"title\":\"Coolant Sender Type\",\"type\":\"string\",\"enum\":[\"US_240_33\",\"EU_450_33\"]}}}");
 }
 
-
 // ============================================================================
 // Convert 8-byte ROM → 16-character hexadecimal string
 // ============================================================================
@@ -352,7 +347,6 @@ String rom_to_hex(const DeviceAddress addr) {
   buf[16] = 0;
   return String(buf);
 }
-
 
 // ============================================================================
 // Convert hex string → ROM address (8 bytes)
@@ -369,7 +363,6 @@ bool hex_to_rom(const String& hex, DeviceAddress addr) {
   }
   return true;
 }
-
 
 // ============================================================================
 // DISCOVER DEVICES ON THE ONE-WIRE BUS
@@ -429,7 +422,7 @@ void discover_onewire_devices() {
 
 
 // ============================================================================
-// DS18 READER — produces °C
+// DS18B20 READER — produces °C
 // ============================================================================
 
 class DS18Reader : public RepeatSensor<float> {
@@ -448,12 +441,12 @@ class DS18Reader : public RepeatSensor<float> {
 };
 
 // ============================================================================
-// SECTION 3 — DS18 PIPELINES + COOLANT SYSTEM + RPM SYSTEM
+// SECTION 3 — DS18B20 PIPELINES + COOLANT SYSTEM + RPM SYSTEM
 // ============================================================================
 
 
 // ============================================================================
-// Build DS18 pipelines after registry is loaded
+// Build DS18B20 pipelines after registry is loaded
 // ============================================================================
 
 void setup_onewire_sensors() {
@@ -514,7 +507,7 @@ void setup_coolant_system() {
   // 1) Raw ADC voltage
   auto adc = std::make_shared<AnalogInput>(
       COOLANT_ADC_PIN,
-      1000,    // sampling interval
+      2000,    // sampling interval
       "",
       3.3f     // scale 1:1
   );
