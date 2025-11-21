@@ -14,6 +14,8 @@
 // SensESP Core
 #include "sensesp.h"
 #include "sensesp_app_builder.h"
+#include "sensesp/transforms/frequency.h"
+#include "sensesp/transforms/moving_average.h"
 
 // Sensors
 #include "sensesp/sensors/analog_input.h"
@@ -21,6 +23,7 @@
 
 // Transforms
 #include "sensesp/transforms/ema.h"
+#include "sensesp/transforms/curveinterpolator.h"
 
 // Signal K Output
 #include "sensesp/signalk/signalk_output.h"
@@ -46,6 +49,10 @@ static const uint8_t RPM_INPUT_PIN = 33;       // op-isolated RPM pulses
 
 static const uint16_t RING_GEAR_TEETH = 116;   // Yanmar 3JH3E / 3GM30F
 static const uint8_t MAX_DS18 = 3;
+
+
+
+
 
 
 // ============================================================================
@@ -100,6 +107,34 @@ class CalibratedADC : public RepeatSensor<float> {
         1100,         // default Vref if not in eFuse
         &cal
     );
+  }
+};
+
+// ============================================================================
+// FUEL FLOW INTERPOLATOR 3JH3E with 18x11 3 blade propeller
+// ============================================================================
+
+
+class FuelInterpreter : public CurveInterpolator {
+ public:
+  FuelInterpreter(String config_path = "")
+      : CurveInterpolator(NULL, config_path) {
+    // Populate a lookup table to translate RPM to m3/s
+    clear_samples();
+    // addSample(CurveInterpolator::Sample(RPM, m3/s));
+    add_sample(CurveInterpolator::Sample(500, 0.00000022));
+    add_sample(CurveInterpolator::Sample(1000, 0.00000022));
+    add_sample(CurveInterpolator::Sample(1500, 0.00000031));
+    add_sample(CurveInterpolator::Sample(1800, 0.00000036));
+    add_sample(CurveInterpolator::Sample(2000, 0.00000047));
+    add_sample(CurveInterpolator::Sample(2200, 0.00000056));
+    add_sample(CurveInterpolator::Sample(2400, 0.00000064));
+    add_sample(CurveInterpolator::Sample(2600, 0.00000075));
+    add_sample(CurveInterpolator::Sample(2800, 0.00000083));
+    add_sample(CurveInterpolator::Sample(3000, 0.00000111));
+    add_sample(CurveInterpolator::Sample(3200, 0.00000139));
+    add_sample(CurveInterpolator::Sample(3400, 0.00000167));
+    add_sample(CurveInterpolator::Sample(3800, 0.00000194));  
   }
 };
 
@@ -831,7 +866,20 @@ void setup() {
   // Start SensESP networking, filesystem watchers, SK client, etc.
   sensesp_app->start();
 
+// fuel flow to SignalK
+
+
+  auto* sensor = new DigitalInputCounter(RPM_INPUT_PIN, INPUT_PULLUP, RISING, 500);
+
+  sensor->connect_to(new Frequency(6))
+  // times by 6 to go from Hz to RPM
+          ->connect_to(new MovingAverage(4, 1.0,"/Engine Fuel/movingAVG"))
+          ->connect_to(new FuelInterpreter("/Engine Fuel/curve"))
+          ->connect_to(new SKOutputFloat("propulsion.engine.fuel.rate", "/Engine Fuel/sk_path"));  
+
+
   debugI("===== Engine Monitor Ready =====");
+
 }
 
 
