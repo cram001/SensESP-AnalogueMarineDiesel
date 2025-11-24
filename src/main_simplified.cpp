@@ -111,9 +111,8 @@ class CalibratedADC : public RepeatSensor<float> {
 };
 
 // ============================================================================
-// FUEL FLOW INTERPOLATOR 3JH3E with 18x11 3 blade propeller
+// FUEL FLOW INTERPOLATOR Yanmar 3JH3E with 18x11 3 blade propeller on 21 000 lbs sailboat
 // ============================================================================
-
 
 class FuelInterpreter : public CurveInterpolator {
  public:
@@ -135,27 +134,35 @@ class FuelInterpreter : public CurveInterpolator {
     add_sample(CurveInterpolator::Sample(3200, 0.00000139));
     add_sample(CurveInterpolator::Sample(3400, 0.00000167));
     add_sample(CurveInterpolator::Sample(3800, 0.00000194));  
+    add_sample(CurveInterpolator::Sample(3900, 0.00000200));  
   }
 };
 
-class TemperatureInterpreter : public CurveInterpolator {
+class TemperatureUSInterpreter : public CurveInterpolator {
  public:
-  TemperatureInterpreter(String config_path = "")
+  TemperatureUSInterpreter(String config_path = "")
       : CurveInterpolator(NULL, config_path) {
     // Populate a lookup table to translate the ohm values returned by
     // our temperature sender to degrees Kelvin
+    // (300-23 ohm european 400-30 ohm american)
     clear_samples();
-    // addSample(CurveInterpolator::Sample(knownOhmValue, knownKelvin));
-    add_sample(CurveInterpolator::Sample(20, 393.15));
-    add_sample(CurveInterpolator::Sample(30, 383.15));
+    // addSample(CurveInterpolator::Sample(knownOhmValue, knownKelvin)) American Sender;
+    add_sample(CurveInterpolator::Sample(20, 410.00));
+    add_sample(CurveInterpolator::Sample(29.6, 394.26));
     add_sample(CurveInterpolator::Sample(40, 373.15));
     add_sample(CurveInterpolator::Sample(55, 363.15));
     add_sample(CurveInterpolator::Sample(70, 353.15));
     add_sample(CurveInterpolator::Sample(100, 343.15));
+    add_sample(CurveInterpolator::Sample(112, 345.37));
+    add_sample(CurveInterpolator::Sample(131, 337.04));
     add_sample(CurveInterpolator::Sample(140, 333.15));
-    add_sample(CurveInterpolator::Sample(200, 323.15));
+    add_sample(CurveInterpolator::Sample(207, 327.04));
     add_sample(CurveInterpolator::Sample(300, 317.15));
     add_sample(CurveInterpolator::Sample(400, 313.15)); 
+    add_sample(CurveInterpolator::Sample(450, 310.93)); 
+    add_sample(CurveInterpolator::Sample(750, 288.15)); 
+    add_sample(CurveInterpolator::Sample(900, 273.00 )); 
+    
   }
 };
 
@@ -178,7 +185,7 @@ static const size_t LOOKUP_TABLE_SIZE = 11;
 
 // ============================================================================
 // VOLTAGE → RESISTANCE TRANSFORM
-// Voltage divider: R1 = 220kΩ, R2 = 100kΩ
+// Voltage divider: R1 = 220kΩ, R2 = 100kΩ coolant temp sender
 // ============================================================================
 
 class VoltageToResistance : public Transform<float, float> {
@@ -204,6 +211,7 @@ class VoltageToResistance : public Transform<float, float> {
     return "{\"type\":\"object\",\"properties\":{\"r1\":{\"title\":\"R1 (ohms)\",\"type\":\"number\"},\"r2\":{\"title\":\"R2 (ohms)\",\"type\":\"number\"}}}";
   }
 
+  //error trapping for out-of-bounds voltage
   void set(const float& v_adc) override {
 
     if (v_adc < 0.02f || v_adc > 3.25f) {
@@ -225,77 +233,20 @@ class VoltageToResistance : public Transform<float, float> {
 // RESISTANCE → TEMPERATURE TRANSFORM
 // ============================================================================
 
-class ResistanceToTemperature : public Transform<float, float> {
- public:
+const float Vin = 3.5;
+const float R1 = 120.0;
+auto* analog_input = new AnalogInput(36, 2000);
 
-  enum SenderType {
-    US_240_33 = 0,
-    EU_450_33 = 1
-  };
+analog_input->connect_to(new AnalogVoltage(Vin, Vin))
+      ->connect_to(new VoltageDividerR2(R1, Vin, "/Engine Temp/sender"))
+      ->connect_to(new TemperatureUSInterpreter("/Engine Temp/curve"))
+      ->connect_to(new Linear(1.0, 0.9, "/Engine Temp/calibrate"))
+      ->connect_to(new MovingAverage(4, 1.0,"/Engine Temp/movingAVG"))
+      ->connect_to(new SKOutputFloat("propulsion.engine.temperature", "/Engine Temp/sk_path"));
 
-  SenderType sender = US_240_33;
-
-  ResistanceToTemperature() : Transform<float, float>("res2temp") {}
-
-  bool to_json(JsonObject& root) override {
-    root["sender"] = (int)sender;
-    return true;
-  }
-
-  bool from_json(const JsonObject& cfg) override {
-    if (cfg["sender"].is<int>()) {
-      sender = (SenderType)cfg["sender"].as<int>();
-    }
-    return true;
-  }
-
-  static String get_config_schema() {
-    return String("{\"type\":\"object\",\"properties\":{\"sender\":{\"title\":\"Coolant Sender Type\",\"type\":\"string\",\"enum\":[\"US_240_33\",\"EU_450_33\"]}}}");
-  }
-
-  void get_table_ptrs(const float*& r_table, const float*& t_table) const {
-    if (sender == US_240_33) {
-      r_table = lookup_us_sender_r;
-      t_table = lookup_us_sender_t;
-    } else {
-      r_table = lookup_eu_sender_r;
-      t_table = lookup_eu_sender_t;
-    }
-  }
-
-  void set(const float& r) override {
-    if (isnan(r)) {
-      emit(NAN);
-      return;
-    }
-
-    const float* r_table;
-    const float* t_table;
-    get_table_ptrs(r_table, t_table);
-
-    // clamp above/below table
-    if (r >= r_table[0]) { emit(t_table[0]); return; }
-    if (r <= r_table[LOOKUP_TABLE_SIZE - 1]) { emit(t_table[LOOKUP_TABLE_SIZE - 1]); return; }
-
-    // interpolate
-    for (size_t i = 0; i < LOOKUP_TABLE_SIZE - 1; i++) {
-      float r1 = r_table[i];
-      float t1 = t_table[i];
-      float r2 = r_table[i + 1];
-      float t2 = t_table[i + 1];
-
-      if (r <= r1 && r >= r2) {
-        float ratio = (r - r2) / (r1 - r2);
-        float tc = t2 + ratio * (t1 - t2);
-        emit(tc);
-        return;
-      }
-    }
-
-    emit(NAN);
-  }
-};
-
+analog_input->connect_to(new AnalogVoltage(Vin, Vin))
+      ->connect_to(new VoltageDividerR2(R1, Vin, "/Engine Temp/sender"))
+      ->connect_to(new SKOutputFloat("propulsion.engine.temperature.raw"));
 
 // ============================================================================
 // °C → Kelvin

@@ -1,51 +1,172 @@
 // SenESP Engine Sensors
-//Code - June 2023
-//Change - Updated fuel used l/m info to fuel rate to Cubic m per second
-
-//#include <Adafruit_BMP280.h>
-#include <Wire.h>
-
-// #include "sensesp_onewire/onewire_temperature.h"
-#include <DallasTemperature.h>
+//Code - Nov 2025
+//Change - Moved from Arduino to PlatformIO, moved from BMP280 to OneWire/Dallas
+// One wire sensor ID store in JSON file
+// Added Fuel Flow calculation based on RPM for Yanmar 3JH3E
 
 #include <Arduino.h>
 
-#include "sensesp/sensors/analog_input.h"
-#include "sensesp/sensors/sensor.h"
-#include "sensesp/signalk/signalk_output.h"
+// SensESP Core
+
 #include "sensesp/system/lambda_consumer.h"
 #include "sensesp_app_builder.h"
-#include "sensesp/transforms/linear.h"
-#include "sensesp/transforms/moving_average.h"
-#include "sensesp/transforms/analogvoltage.h"
-#include "sensesp/transforms/curveinterpolator.h"
-#include "sensesp/transforms/voltagedivider.h"
-#include "sensesp/sensors/digital_input.h"
-#include "sensesp/transforms/frequency.h"
 
+// Sensors
+#include "sensesp_onewire/dallas_temperature_sensors.h"
+#include "sensesp/sensors/analog_input.h"
+#include "sensesp/sensors/digital_input.h"
+#include "sensesp/sensors/sensor.h"
+#include "sensesp.h"
+#include "sensesp/sensors/analog_input.h"
+
+// OneWire + DS18B20
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// Transforms
+#include "sensesp/transforms/ema.h"
+#include "sensesp/transforms/curveinterpolator.h"
+#include "sensesp/transforms/frequency.h"
+#include "sensesp/transforms/moving_average.h"
+#include "sensesp/transforms/linear.h"
+#include "sensesp/transforms/frequency.h"
+#include "sensesp/transforms/analogvoltage.h"
+#include "sensesp/transforms/voltagedivider.h"
+
+// SignalK Output
+#include "sensesp/signalk/signalk_output.h"
+
+// Config & Filesystem
+#include "sensesp/system/filesystem.h"
+#include "sensesp/system/valueconsumer.h"
+#include "sensesp/system/observable.h"
 
 using namespace sensesp;
 
-class TemperatureInterpreter : public CurveInterpolator {
+// ============================================================================
+// CONSTANTS AND PIN ASSIGNMENTS
+// ============================================================================
+
+static const uint8_t COOLANT_ADC_PIN = 34;     // buffered ADC input via voltage divider
+static const uint8_t ONE_WIRE_PIN = 4;         // DS18B20 bus
+static const uint8_t RPM_INPUT_PIN = 33;       // op-isolated RPM pulses via op-amp buffer
+
+static const uint16_t RING_GEAR_TEETH = 116;   // Yanmar 3JH3E 116/ 3GM30F 97
+static const uint8_t MAX_DS18 = 3;  //max number of DS18B20 sensors to read
+
+// ============================================================================
+// VOLTAGE → RESISTANCE TRANSFORM
+// Voltage divider: R1 = 220kΩ, R2 = 100kΩ coolant temp sender
+// ============================================================================
+
+class VoltageToResistance : public Transform<float, float> {
  public:
-  TemperatureInterpreter(String config_path = "")
+  float r1 = 220000.0f;   
+  float r2 = 100000.0f;
+
+  VoltageToResistance() : Transform<float, float>("volt2res") {}
+
+  bool to_json(JsonObject& root) override {
+    root["r1"] = r1;
+    root["r2"] = r2;
+    return true;
+  }
+
+  bool from_json(const JsonObject& cfg) override {
+    if (cfg["r1"].is<float>()) r1 = cfg["r1"].as<float>();
+    if (cfg["r2"].is<float>()) r2 = cfg["r2"].as<float>();
+    return true;
+  }
+
+  static String get_config_schema() {
+    return "{\"type\":\"object\",\"properties\":{\"r1\":{\"title\":\"R1 (ohms)\",\"type\":\"number\"},\"r2\":{\"title\":\"R2 (ohms)\",\"type\":\"number\"}}}";
+  }
+
+  //error trapping for out-of-bounds voltage
+  void set(const float& v_adc) override {
+
+    if (v_adc < 0.02f || v_adc > 3.25f) {
+      emit(NAN);
+      return;
+    }
+
+    // Solve divider
+    // v_adc = 3.3 * (R2 / (R_sensor + R2))
+    float vs = 3.3f;
+    float rs = (r2 * (vs / v_adc)) - r2;
+
+    emit(rs);
+  }
+};
+
+// ============================================================================
+// RESISTANCE → TEMPERATURE TRANSFORM
+// ============================================================================
+
+const float Vin = 3.5;
+const float R1 = 120.0;
+auto* analog_input = new AnalogInput(36, 2000);
+
+analog_input->connect_to(new AnalogVoltage(Vin, Vin))
+      ->connect_to(new VoltageDividerR2(R1, Vin, "/Engine Temp/sender"))
+      ->connect_to(new TemperatureUSInterpreter("/Engine Temp/curve"))
+      ->connect_to(new Linear(1.0, 0.9, "/Engine Temp/calibrate"))
+      ->connect_to(new MovingAverage(4, 1.0,"/Engine Temp/movingAVG"))
+      ->connect_to(new SKOutputFloat("propulsion.engine.temperature", "/Engine Temp/sk_path"));
+
+//analog_input->connect_to(new AnalogVoltage(Vin, Vin))
+//      ->connect_to(new VoltageDividerR2(R1, Vin, "/Engine Temp/sender"))
+//      ->connect_to(new SKOutputFloat("propulsion.engine.temperature.raw"));
+
+// ============================================================================
+// °C → Kelvin
+// ============================================================================
+
+class CelsiusToKelvin : public Transform<float, float> {
+ public:
+  CelsiusToKelvin() : Transform<float,float>("c2k") {}
+
+  void set(const float& c) override {
+    emit(isnan(c) ? NAN : c + 273.15f);
+  }
+};
+
+
+// ============================================================================
+// COOLANT TEMPERATURE LOOKUP TABLES FOR US SENDER (450-30 Ohm)
+// ============================================================================
+
+class TemperatureUSInterpreter : public CurveInterpolator {
+ public:
+  TemperatureUSInterpreter(String config_path = "")
       : CurveInterpolator(NULL, config_path) {
     // Populate a lookup table to translate the ohm values returned by
     // our temperature sender to degrees Kelvin
     clear_samples();
-    // addSample(CurveInterpolator::Sample(knownOhmValue, knownKelvin));
-    add_sample(CurveInterpolator::Sample(20, 393.15));
-    add_sample(CurveInterpolator::Sample(30, 383.15));
+    // addSample(CurveInterpolator::Sample(knownOhmValue, knownKelvin)) American Sender;
+    add_sample(CurveInterpolator::Sample(20, 410.00));
+    add_sample(CurveInterpolator::Sample(29.6, 394.26));
     add_sample(CurveInterpolator::Sample(40, 373.15));
     add_sample(CurveInterpolator::Sample(55, 363.15));
     add_sample(CurveInterpolator::Sample(70, 353.15));
     add_sample(CurveInterpolator::Sample(100, 343.15));
+    add_sample(CurveInterpolator::Sample(112, 345.37));
+    add_sample(CurveInterpolator::Sample(131, 337.04));
     add_sample(CurveInterpolator::Sample(140, 333.15));
-    add_sample(CurveInterpolator::Sample(200, 323.15));
+    add_sample(CurveInterpolator::Sample(207, 327.04));
     add_sample(CurveInterpolator::Sample(300, 317.15));
     add_sample(CurveInterpolator::Sample(400, 313.15)); 
+    add_sample(CurveInterpolator::Sample(450, 310.93)); 
+    add_sample(CurveInterpolator::Sample(750, 288.15)); 
+    add_sample(CurveInterpolator::Sample(900, 273.00 )); 
+    
   }
 };
+
+// ============================================================================
+// FUEL FLOW INTERPOLATOR Yanmar 3JH3E with 18x11 3 blade propeller on 21 000 lbs sailboat
+// Consumption correct @ 2800 rpm (2.7L/hr)
+// ============================================================================
 
 class FuelInterpreter : public CurveInterpolator {
  public:
@@ -54,28 +175,30 @@ class FuelInterpreter : public CurveInterpolator {
     // Populate a lookup table to translate RPM to m3/s
     clear_samples();
     // addSample(CurveInterpolator::Sample(RPM, m3/s));
-    add_sample(CurveInterpolator::Sample(500, 0.00000011));
-    add_sample(CurveInterpolator::Sample(1000, 0.00000019));
-    add_sample(CurveInterpolator::Sample(1500, 0.0000003));
-    add_sample(CurveInterpolator::Sample(1800, 0.00000041));
-    add_sample(CurveInterpolator::Sample(2000, 0.00000052));
-    add_sample(CurveInterpolator::Sample(2200, 0.00000066));
-    add_sample(CurveInterpolator::Sample(2400, 0.00000079));
-    add_sample(CurveInterpolator::Sample(2600, 0.00000097));
-    add_sample(CurveInterpolator::Sample(2800, 0.00000124));
-    add_sample(CurveInterpolator::Sample(3000, 0.00000153));
-    add_sample(CurveInterpolator::Sample(3200, 0.00000183));
-    add_sample(CurveInterpolator::Sample(3400, 0.000002));
-    add_sample(CurveInterpolator::Sample(3800, 0.00000205));  
+    add_sample(CurveInterpolator::Sample(500, 0.00000022));
+    add_sample(CurveInterpolator::Sample(1000, 0.00000022));
+    add_sample(CurveInterpolator::Sample(1500, 0.00000031));
+    add_sample(CurveInterpolator::Sample(1800, 0.00000036));
+    add_sample(CurveInterpolator::Sample(2000, 0.00000047));
+    add_sample(CurveInterpolator::Sample(2200, 0.00000056));
+    add_sample(CurveInterpolator::Sample(2400, 0.00000064));
+    add_sample(CurveInterpolator::Sample(2600, 0.00000075));
+    add_sample(CurveInterpolator::Sample(2800, 0.00000083));
+    add_sample(CurveInterpolator::Sample(3000, 0.00000111));
+    add_sample(CurveInterpolator::Sample(3200, 0.00000139));
+    add_sample(CurveInterpolator::Sample(3400, 0.00000167));
+    add_sample(CurveInterpolator::Sample(3800, 0.00000194));  
+    add_sample(CurveInterpolator::Sample(3900, 0.00000200));  
   }
 };
 
-reactesp::ReactESP app;
 
-  Adafruit_BMP280 bmp280;
+// reactesp::ReactESP app;
 
-  float read_temp_callback() { return (bmp280.readTemperature() + 273.15);}
-  float read_pressure_callback() { return (bmp280.readPressure());}
+//  Adafruit_BMP280 bmp280;
+
+//  float read_temp_callback() { return (bmp280.readTemperature() + 273.15);}
+//  float read_pressure_callback() { return (bmp280.readPressure());}
 
 // The setup function performs one-time application initialization.
 void setup() {
@@ -96,21 +219,23 @@ void setup() {
                     // ->enable_ota("raspberry")
                     ->get_app();
 
-
 /// 1-Wire Temp Sensors - Exhaust Temp & Oil Temp Sensors ///
 
-  DallasTemperatureSensors* dts = new DallasTemperatureSensors(17);
+DallasTemperatureSensors* dts = new DallasTemperatureSensors(17);
 
-//exhaust
+//exhaust config
   auto* exhaust_temp =
       new OneWireTemperature(dts, 1000, "/Exhaust Temperature/oneWire");
+
 //oil config (remove if not required, can also be copied for more sensors)
   auto* oil_temp =
       new OneWireTemperature(dts, 1000, "/Oil Temperature/oneWire");
+
 //exhaust
   exhaust_temp->connect_to(new Linear(1.0, 0.0, "/Exhaust Temperature/linear"))
       ->connect_to(
           new SKOutputFloat("propulsion.engine.1.exhaustTemperature","/Exhaust Temperature/sk_path"));
+ 
  //oil (remove if not required, can also be copied for more sensors)
  oil_temp->connect_to(new Linear(1.0, 0.0, "/Oil Temperature/linear"))
       ->connect_to(
@@ -157,6 +282,7 @@ void setup() {
 
   engine_room_pressure->connect_to(new SKOutputFloat("propulsion.engineRoom.pressure"));
 
+  
 //// Engine Temp Config ////
 
 const float Vin = 3.5;
@@ -174,28 +300,8 @@ analog_input->connect_to(new AnalogVoltage(Vin, Vin))
       ->connect_to(new VoltageDividerR2(R1, Vin, "/Engine Temp/sender"))
       ->connect_to(new SKOutputFloat("propulsion.engine.temperature.raw"));
 
-//// Bilge Monitor /////
-
-auto* bilge = new DigitalInputState(25, INPUT_PULLUP, 5000);
-
-auto int_to_string_function = [](int input) ->String {
-     if (input == 1) {
-       return "Water present!";
-     } 
-     else { // input == 0
-       return "bilge clear";
-     }
-};
-
-auto int_to_string_transform = new LambdaTransform<int, String>(int_to_string_function);
-
-bilge->connect_to(int_to_string_transform)
-      ->connect_to(new SKOutputString("propulsion.engine.bilge"));
-
-bilge->connect_to(new SKOutputString("propulsion.engine.bilge.raw"));
-
-  // Start networking, SK server connections and other SensESP internals
-  sensesp_app->start();
 }
+
+
 
 void loop() { app.tick(); }
