@@ -1,0 +1,2 @@
+#pragma once
+#define SENSESP_DISABLE_SYSTEM_STATUS_LED 1
