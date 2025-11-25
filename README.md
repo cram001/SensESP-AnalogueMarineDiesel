@@ -30,6 +30,7 @@ Installation:
 6. Confirm your voltage divider uses the specified R1 and R2 values
 7. Build and install the code
 8. After booting up and connecting sensors, Access the ui via web browser by connecting directly the wifi accesspoint created by the ESP32
+   
      a. 192.168.4.1 i
    
      b. Configure wifi
