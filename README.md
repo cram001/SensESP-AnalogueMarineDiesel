@@ -13,6 +13,7 @@ You will need:
 - ESP32 board with wifi (4 MB flash min, 16 MB recommended)
 - Voltage divider to sense the engine's coolant temp sender
 - Op Amp to sense the engine's tach sender
+- Opto isolator to eliminate engine noise in the tach signal
 - Proto board to build the voltage divider
 - 18-22 AWG wire for connections
 - 12VDC to 5 V USB-C power adapter to power the ESP32
