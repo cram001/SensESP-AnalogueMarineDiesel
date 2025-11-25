@@ -1,4 +1,4 @@
-# SensESP-project-template-main
+# SensESP-Analogue to Digital converter for marine diesel engine
 
 ESP32 Boat Analogue Diesel Engine ADC (analogue to digital converter).
 Working on the progress made by Boatingwiththebaileys (https://github.com/Boatingwiththebaileys/ESP32-code)
