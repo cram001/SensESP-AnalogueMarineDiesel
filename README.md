@@ -75,3 +75,5 @@ Recommended Hardware
 
 Currently (Nov 2025) the code was developped and tested on a FireBeetle 2 ESP32-E (4MB Flash). However, to make space for future functionality, the 16MB flash version is highly recommended (FireBeetle 2 ESP32-E (N16R2))
 
+Want to buy a commercial ready to use product to achieve the same? See Across Ocean Systems Single Engine Gateway – NMEA2000 https://acrossoceansystems.com/index.php/product/single-analog-engine-gateway/ (no affiliation)
+
