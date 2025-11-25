@@ -2,39 +2,39 @@
 // ============================================================================
 // ANALOGUE DIESEL ENGINE MONITOR — ESP32 + SensESP 3.x
 // Features:
-//   • Coolant temperature sender (Teleflex/Faria US 240–33Ω, extended range)
-//   • Up to 3 × DS18B20 sensors with persistent registry + SK paths
-//   • ISR-based magnetic pickup RPM + tach-loss
-//   • Fuel burn estimation via CurveInterpolator
-//   • WiFi + SK config handled by SensESP
+//   • Coolant temperature sender (Teleflex/Faria US 240–33 Ω / extended range)
+//   • Up to 3 × DS18B20 sensors (SensESP OneWire v3.x)
+//   • ISR-based magnetic pickup RPM
+//   • Fuel burn estimation using CurveInterpolator
+//   • WiFi + Signal K handled by SensESP 3.x app builder
 // ============================================================================
 
 #include <Arduino.h>
 
-// SensESP Core
+// SensESP core
 #include "sensesp.h"
 #include "sensesp_app_builder.h"
+#include "sensesp/system/filesystem.h"
 
-// Sensors / Transforms
-#include "sensesp/sensors/analog_input.h"
+
+// Sensors / transforms
+#include "sensesp/sensors/sensor.h"
 #include "sensesp/transforms/curveinterpolator.h"
 #include "sensesp/transforms/ema.h"
 #include "sensesp/transforms/moving_average.h"
-
-// Output
 #include "sensesp/signalk/signalk_output.h"
 
-// Config / FS
-#include "sensesp/system/filesystem.h"
+// SensESP Analog Input (non-templated)
+#include "sensesp/sensors/analog_input.h"
 
-// OneWire + SensESP Dallas wrapper
-// #include "sensesp_onewire/onewire_bus.h"
-// #include "sensesp_onewire/dallas_temperature_sensors.h"
+// SensESP OneWire subsystem
+#include "sensesp_onewire/onewire_temperature.h"
 
 // ESP32 ADC calibration
 #include "esp_adc_cal.h"
 
 using namespace sensesp;
+// using namespace sensesp::onewire;
 
 // ============================================================================
 // CONSTANTS
@@ -44,27 +44,27 @@ static const uint8_t ONE_WIRE_PIN    = 4;
 static const uint8_t RPM_INPUT_PIN   = 33;
 
 static const uint16_t RING_GEAR_TEETH = 116;
-static const uint8_t  MAX_DS18 = 3;
 
 // ============================================================================
-// ADC with ESP calibration
+// CUSTOM ADC SENSOR (SensESP 3.x — RepeatSensor is NOT templated)
 // ============================================================================
-class CalibratedADC : public RepeatSensor<float> {
+
+class CalibratedADC : public sensesp::RepeatSensor<float> {
  public:
-  int pin;
+  int adc_pin;
   esp_adc_cal_characteristics_t cal;
 
-  CalibratedADC(int pin, uint32_t interval_ms)
-      : RepeatSensor<float>(interval_ms, [this]() {
-          uint32_t raw = analogRead(pin);
-          uint32_t mv  = esp_adc_cal_raw_to_voltage(raw, &cal);
-          return mv / 1000.0f;
-        }),
-        pin(pin) {
-
+  CalibratedADC(int adc_pin, uint32_t interval_ms)
+      : adc_pin(adc_pin),
+        sensesp::RepeatSensor<float>(
+            interval_ms,
+            [this]() -> float {
+              uint32_t raw = analogRead(this->adc_pin);
+              uint32_t mv  = esp_adc_cal_raw_to_voltage(raw, &this->cal);
+              return mv / 1000.0f;
+            }) {
     analogReadResolution(12);
-    analogSetPinAttenuation(pin, ADC_11db);
-
+    analogSetPinAttenuation(adc_pin, ADC_11db);
     esp_adc_cal_characterize(
         ADC_UNIT_1,
         ADC_ATTEN_DB_11,
@@ -74,12 +74,13 @@ class CalibratedADC : public RepeatSensor<float> {
   }
 };
 
+
 // ============================================================================
-// Voltage Divider → Resistance
+// Voltage Divider → Resistance transform
 // ============================================================================
 class VoltageToResistance : public Transform<float, float> {
  public:
-  float r_fixed = 100000.0f;  // bottom resistor
+  float r_fixed = 100000.0f; // 100k bottom resistor
 
   VoltageToResistance() : Transform<float, float>("volt2res") {}
 
@@ -95,12 +96,12 @@ class VoltageToResistance : public Transform<float, float> {
 };
 
 // ============================================================================
-// Temperature sender curve interpolation (Kelvin output)
+// Temperature Sender Curve (resistance Ω → Kelvin)
 // ============================================================================
 class TemperatureUSInterpreter : public CurveInterpolator {
  public:
   TemperatureUSInterpreter(String path = "")
-    : CurveInterpolator(NULL, path) {
+      : CurveInterpolator(NULL, path) {
 
     clear_samples();
     add_sample({20,  410.00});
@@ -122,12 +123,12 @@ class TemperatureUSInterpreter : public CurveInterpolator {
 };
 
 // ============================================================================
-// Fuel burn curve (m³/s)
+// Fuel Burn Curve (RPM → volume flow m³/s)
 // ============================================================================
 class FuelInterpreter : public CurveInterpolator {
  public:
   FuelInterpreter(String path = "")
-    : CurveInterpolator(NULL, path) {
+      : CurveInterpolator(NULL, path) {
 
     clear_samples();
     add_sample({500,  0.00000022});
@@ -148,45 +149,6 @@ class FuelInterpreter : public CurveInterpolator {
 };
 
 // ============================================================================
-// OneWire Registry (persistent)
-// ============================================================================
-class OneWireRegistry : public FileSystemSaveable {
- public:
-  std::vector<String> addrs;
-  std::vector<String> names;
-  std::vector<String> sk_paths;
-
-  OneWireRegistry() : FileSystemSaveable("onewire") {}
-
-  bool to_json(JsonObject& root) override {
-    JsonArray a = root.createNestedArray("sensors");
-    for (size_t i = 0; i < addrs.size(); i++) {
-      JsonObject o = a.add<JsonObject>();
-      o["address"]  = addrs[i];
-      o["name"]     = names[i];
-      o["sk_path"]  = sk_paths[i];
-    }
-    return true;
-  }
-
-  bool from_json(const JsonObject& cfg) override {
-    addrs.clear();
-    names.clear();
-    sk_paths.clear();
-
-    if (!cfg["sensors"].is<JsonArray>()) return true;
-    for (auto o : cfg["sensors"].as<JsonArray>()) {
-      addrs.push_back(o["address"] | "");
-      names.push_back(o["name"] | "");
-      sk_paths.push_back(o["sk_path"] | "");
-    }
-    return true;
-  }
-};
-
-OneWireRegistry registry;
-
-// ============================================================================
 // ISR RPM
 // ============================================================================
 volatile uint32_t rpm_pulses = 0;
@@ -194,98 +156,114 @@ volatile uint32_t last_us = 0;
 
 void IRAM_ATTR rpm_isr() {
   uint32_t now = micros();
-  if (now - last_us > 1500) {
+  if (now - last_us > 100) {  // Debounce
     rpm_pulses++;
     last_us = now;
   }
 }
 
-class RPMCalc : public RepeatSensor<float> {
+class RPMCalc : public sensesp::RepeatSensor<float> {
  public:
+  uint32_t interval_ms;
+
   RPMCalc(uint32_t interval_ms)
-      : RepeatSensor<float>(interval_ms, [interval_ms]() {
-          uint32_t p = rpm_pulses;
-          rpm_pulses = 0;
-          float revs = float(p) / float(RING_GEAR_TEETH);
-          float rps  = revs / (interval_ms / 1000.0f);
-          return rps * 60.0f;
-        }) {}
+      : interval_ms(interval_ms),
+        sensesp::RepeatSensor<float>(
+            interval_ms,
+            [this, interval_ms]() -> float {
+              uint32_t p = rpm_pulses;
+              rpm_pulses = 0;
+
+              float revs = float(p) / float(RING_GEAR_TEETH);
+              float rpm = (revs / (float(interval_ms) / 1000.0f)) * 60.0f;
+
+              return rpm;
+            }
+        ) {}
 };
 
 // ============================================================================
-// BUILD SUBSYSTEMS
+// COOLANT SYSTEM
 // ============================================================================
 void setup_coolant() {
-  auto adc = std::make_shared<CalibratedADC>(COOLANT_ADC_PIN, 1000);
-  auto v2r = std::make_shared<VoltageToResistance>();
-  auto tcurve = std::make_shared<TemperatureUSInterpreter>();
 
-  auto sk = std::make_shared<SKOutput<float>>(
+  auto adc    = std::make_shared<CalibratedADC>(COOLANT_ADC_PIN, 1000);
+  auto v2r    = std::make_shared<VoltageToResistance>();
+  auto curve  = std::make_shared<TemperatureUSInterpreter>();
+
+  auto sk = std::make_shared<SKOutputFloat>(
       "propulsion.engine.coolantTemperature",
-      "/Engine/Coolant");
+      "/Engine/CoolantTemperature");
 
   adc->connect_to(v2r)
-     ->connect_to(tcurve)
-     ->connect_to(sk);
+      ->connect_to(curve)
+      ->connect_to(sk);
 }
 
+// ============================================================================
+// OneWire (SensESP 3.x)
+// ============================================================================
 void setup_onewire() {
-  auto bus = std::make_shared<OneWireBus>(ONE_WIRE_PIN);
-  auto sensors = std::make_shared<DallasTemperatureSensors>(bus);
 
-  sensors->set_read_delay(1000);
+  auto* dts = new sensesp::onewire::DallasTemperatureSensors(ONE_WIRE_PIN);
+  uint read_delay = 1000;
 
-  for (size_t i = 0; i < sensors->num_sensors() && i < MAX_DS18; i++) {
+  for (int i = 1; i <= 3; i++) {
+    String path = "/OneWire/S" + String(i);
 
-    String sk = (i < registry.sk_paths.size())
-                  ? registry.sk_paths[i]
-                  : "environment.temp.ds18." + String(i+1);
+    auto t = new sensesp::onewire::OneWireTemperature(dts, read_delay, path);
+    auto sk = new SKOutputFloat(
+        "environment.sensors.onewire." + String(i),
+        path + "/SK");
 
-    auto skout = std::make_shared<SKOutput<float>>(sk,
-                    "/DS18/" + String(i+1));
-
-    // *** FIXED ***
-    sensors->temperature(i)->connect_to(skout);
+    t->connect_to(sk);
   }
 }
 
-
+// ============================================================================
+// RPM SYSTEM
+// ============================================================================
 void setup_rpm() {
+
   pinMode(RPM_INPUT_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(RPM_INPUT_PIN), rpm_isr, RISING);
 
-  auto rpm = std::make_shared<RPMCalc>(100);
-  auto ema = std::make_shared<EMA>(0.3f);
+  auto rpm  = std::make_shared<RPMCalc>(100);
+  auto ema  = std::make_shared<EMA>(0.3);
 
-  auto out = std::make_shared<SKOutput<float>>(
+  auto skrpm = std::make_shared<SKOutputFloat>(
       "propulsion.engine.revolutions",
       "/Engine/RPM");
 
-  rpm->connect_to(ema)->connect_to(out);
+  rpm->connect_to(ema)->connect_to(skrpm);
 
-  // fuel burn
   auto fuel = std::make_shared<FuelInterpreter>();
-  auto fuel_out = std::make_shared<SKOutput<float>>(
+  auto skfuel = std::make_shared<SKOutputFloat>(
       "propulsion.engine.fuel.rate",
       "/Engine/FuelRate");
 
-  rpm->connect_to(fuel)->connect_to(fuel_out);
+  rpm->connect_to(fuel)->connect_to(skfuel);
 }
 
 // ============================================================================
-// BUILD + SETUP
+// BUILD SYSTEM
 // ============================================================================
 void build_system() {
-  registry.load();
-  setup_onewire();
   setup_coolant();
+  setup_onewire();
   setup_rpm();
 }
 
+// ============================================================================
+// MAIN SETUP + LOOP
+// ============================================================================
 void setup() {
+
   SetupLogging(ESP_LOG_INFO);
+
   SensESPAppBuilder builder;
-  sensesp_app = builder.set_hostname("engine-monitor")->get_app();
+  builder.set_hostname("engine-monitor");
+  sensesp_app = builder.get_app();
 
   build_system();
   sensesp_app->start();
