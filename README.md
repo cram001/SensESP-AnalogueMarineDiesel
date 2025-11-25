@@ -20,8 +20,10 @@ This iteration provides:
 - User selectable wifi ssid and passphrase
 - Basic config over webui
 - OTA updates via webui
-- Data input smoothing and out of range values handling
+- Data input smoothing and out of range input values handling
+- Persistence storage of user configured settings and values, along with OneWire sensor ID.
 - Updated to use SensESP v3.x and OneWire v3.x
+  
 
 Installation:
 1. Install VSCode
