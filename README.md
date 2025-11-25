@@ -7,7 +7,19 @@ Working on the progress made by Boatingwiththebaileys (https://github.com/Boatin
 
 Essentially, leverages an existing SignalK installation (Cerbo GX OS Large or OpenPlotter on an RPI) to use a small, efficient ESP32 board (https://www.dfrobot.com/product-2837.html) and a few additional boards to convert the engine's analogue signals to digital signals which can be sent to NMEA2000 (or NMEA0183) via SignalK.
 
-Requires basic soldering skills as a voltage divider must be assembledon a prototype board.
+Requires basic soldering skills as a voltage divider must be assembled on a prototype board.
+
+You will need:
+- ESP32 board with wifi (4 MB flash min, 16 MB recommended)
+- Voltage divider to sense the engine's coolant temp sender
+- Op Amp to sense the engine's tach sender
+- Proto board to build the voltage divider
+- 18-22 AWG wire for connections
+- 12VDC to 5 V USB-C power adapter to power the ESP32
+- A box to protect the ESP32 and sub-boards
+- One wire DS18B20 temp sensors
+
+  All components can be purchased for under USD35.
 
 This iteration provides:
 - Sense engine RPM from flywheel sensor (set to 116 teeth for 3JH3E engine, check your service manual to adjust)
