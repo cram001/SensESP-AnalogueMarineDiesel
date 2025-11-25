@@ -3,7 +3,9 @@
 ESP32 Boat Analogue Diesel Engine ADC (analogue to digital converter).
 Working on the progress made by Boatingwiththebaileys (https://github.com/Boatingwiththebaileys/ESP32-code)
 
-Essentially, leverages an existing SignalK installation (Cerbo GX OS Large or OpenPlotter on an RPI) to use a small, efficient ESP32 and a few additional boards to convert the engine's analogue signals to digital signals which can be sent to NMEA2000 (or NMEA0183) via SignalK.
+Essentially, leverages an existing SignalK installation (Cerbo GX OS Large or OpenPlotter on an RPI) to use a small, efficient ESP32 board (https://www.dfrobot.com/product-2837.html) and a few additional boards to convert the engine's analogue signals to digital signals which can be sent to NMEA2000 (or NMEA0183) via SignalK.
+
+Requires basic soldering skills as a voltage divider must be assembledon a prototype board.
 
 This iteration provides:
 - Sense engine RPM from flywheel sensor (set to 116 teeth for 3JH3E engine, check your service manual to adjust)
