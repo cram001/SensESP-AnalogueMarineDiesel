@@ -1,11 +1,11 @@
-# SensESP-Analogue to Digital converter for marine diesel engine
+# SensESP-Analogue to Digital converter for marine diesel engine instruments
 
 Designed for a Yanmar 3JH3E, but could easily be adapted to other Yanmar engines (GM, YM) or Beta that have analogue instrumentation.
 
 ESP32 Boat Analogue Diesel Engine ADC (analogue to digital converter).
 Working on the progress made by Boatingwiththebaileys (https://github.com/Boatingwiththebaileys/ESP32-code)
 
-Essentially, leverages an existing SignalK installation (Cerbo GX OS Large or OpenPlotter on an RPI) to use a small, efficient ESP32 board (https://www.dfrobot.com/product-2837.html) and a few additional boards to convert the engine's analogue signals to digital signals which can be sent to NMEA2000 (or NMEA0183) via SignalK.
+Essentially, leverages an existing SignalK installation (Cerbo GX OS Large or OpenPlotter on an Rasperry Pi) to use a small, efficient ESP32 board (https://www.dfrobot.com/product-2837.html) and a few additional boards to convert the engine's analogue sensor signals to digital signals which can be sent to NMEA2000 (or NMEA0183) via SignalK. The connections will not affect the engine's gaugues. Additional temp sensors can be connected to monitor exhaust elbow temperature, engine comparment temp, etc...
 
 Requires basic soldering skills as a voltage divider must be assembled on a prototype board.
 
@@ -59,14 +59,16 @@ Installation:
 
      f. Click restart
    
-10. Access your SignalK server and assign the paths to NMEA2K variables
-11. Setup your instruments to display the desired data collected via the ESP32
+9. Access your SignalK server and assign the paths to NMEA2K variables
+10. Setup your instruments to display the desired data collected via the ESP32
 
-Future updates, add compatibiltiy for:
+
+Future updates, planned to add compatibiltiy for:
 - oil pressure sender
 - user selectable alternator or flywheel tach sender, along with number of flywheel tooth via webui
 - user selectable pre-defined US or European temp sender curve and US or European oil pressure sender curve
 - User input of fuel consumption / rpm curve via web ui
+- Sense high coolant temp, low oil pressure and no charge alarm signals
 
 
 Recommended Hardware
