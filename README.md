@@ -31,13 +31,19 @@ Installation:
 7. Build and install the code
 8. After booting up and connecting sensors, Access the ui via web browser by connecting directly the wifi accesspoint created by the ESP32
      a. 192.168.4.1 i
+   
      b. Configure wifi
+
      c. Once connected to your wifi access point, the ui should be available via:  https://sensesp.local or myhostname.local if you have changed myhostname
+
      d. Assign your signalk server IP and port
+
      e. Assign signalk paths to the connected OneWire senders (it should auto detect and list all connected senders)
+
      f. Click restart
-9. Access your SignalK server and assign the paths to NMEA2K variables
-10. Setup your instruments to display the desired data collected via the ESP32
+   
+10. Access your SignalK server and assign the paths to NMEA2K variables
+11. Setup your instruments to display the desired data collected via the ESP32
 
 Future updates, add compatibiltiy for:
 - oil pressure sender
