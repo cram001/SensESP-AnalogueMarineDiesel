@@ -11,7 +11,7 @@ This iteration provides:
 - Sense engine RPM from flywheel sensor (set to 116 teeth for 3JH3E engine, check your service manual to adjust)
     o Isolated from the engine noise via an op-amp
 - Sense coolant temperature from the panel's engine coolant thermocouple, without affecting the panel gauge
-    o Uses  voltage divider R1 = and R2 =
+    o Uses  voltage divider R1 = 220 kOhm and R2 = 100kOhm
     o Uses user provided resitance to temperature (in Kelvins) curve ... currently set for US temp sender resistance
 - Optionally uses up to 3 onewire temp sensors (ex: exhaust elbow, engine compartment, etc... with user assignable paths)
 - Calculates fuel flow based on RPM with user provided fuel curve (in m3/sec)
