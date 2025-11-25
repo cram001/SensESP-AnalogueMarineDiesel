@@ -1,5 +1,7 @@
 # SensESP-Analogue to Digital converter for marine diesel engine
 
+Designed for a Yanmar 3JH3E, but could easily be adapted to other Yanmar engines (GM, YM) or Beta that have analogue instrumentation.
+
 ESP32 Boat Analogue Diesel Engine ADC (analogue to digital converter).
 Working on the progress made by Boatingwiththebaileys (https://github.com/Boatingwiththebaileys/ESP32-code)
 
