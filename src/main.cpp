@@ -175,7 +175,7 @@ volatile uint32_t last_us    = 0;
 
 void IRAM_ATTR rpm_isr() {
   uint32_t now = micros();
-  if (now - last_us > 100) {
+  if (now - last_us > 75) {     // debounce: ignore pulses < 75us apart (works up to 4000 RPM), min 110 for 3800 RPM
     rpm_pulses++;
     last_us = now;
   }
