@@ -1,8 +1,10 @@
 //
 // ============================================================================
 // ANALOGUE DIESEL ENGINE MONITOR — ESP32 + SensESP 3.x
-// Optimized: no CurveInterpolator, static linear interpolation,
-// reduced lambdas, fewer heap objects, faster execution.
+// Senses magnetic RPM pulses (off ring gear), coolante temp sender and
+// temperatures from up to 5 OneWire DS18B20 sensors.
+// Requires ESP32 with min 4MB flash (recommended 16MB), voltage divider
+// for coolant sender, an op-amp buffer for the RPM sender
 // ============================================================================
 
 #include <Arduino.h>
@@ -45,7 +47,8 @@ std::shared_ptr<PersistingObservableValue<float>> engine_hours;
 static float g_last_rpm = 0.0f;
 
 // ---------------------------------------------------------------------------
-// Hardware constants
+// Hardware constants (CHANGE PIN ASSIGNMENTS AS NEEDED, REFER
+// TO ESP32 DOCUMENTATION BEFORE CHANGING PINT OUT)
 // ---------------------------------------------------------------------------
 static const uint8_t COOLANT_ADC_PIN = 34;
 static const uint8_t ONE_WIRE_PIN    = 4;
@@ -109,11 +112,16 @@ class CalibratedADC : public RepeatSensor<float> {
 
 // ============================================================================
 // Voltage → Resistance (Thermistor divider)
+// Change value of R_fixed based on R2 of the voltage divider
+// Values of R1 and R2 must be suffiiently high to not overload
+// the ADC input (e.g., 200kΩ and 100kΩ), recommend testing voltage at sender
+// under various temperatures / battery voltages to confirm it does not exceed 3.3V
+// after the divider
 // ============================================================================
 
 class VoltageToResistance : public Transform<float, float> {
  public:
-  float R_fixed = 100000.0f;
+  float R_fixed = 100000.0f;   // edit based on voltage divider R2 value
 
   VoltageToResistance() : Transform<float, float>("volt2res") {}
 
@@ -130,18 +138,56 @@ class VoltageToResistance : public Transform<float, float> {
 
 // ============================================================================
 // EXACT ORIGINAL COOLANT CURVE (Ω → Kelvin)
+// coolant resistance to temperature (in kelvins) lookup table
+// calibrated for American coolant temp sender (most Yanmar engines
+// use a European sender with different characteristics)
+// X being the resistance in ohms, Y being the temperature in kelvins
 // ============================================================================
 
-static const float COOLANT_X[] = {
-  20, 29.6, 40, 55, 70, 100,
-  112, 131, 140, 207, 300,
-  400, 450, 750, 900
+// ============================================================================
+// EXACT ORIGINAL COOLANT CURVE (Ω → Kelvin)
+// coolant resistance to temperature (in kelvins) lookup table
+// calibrated for American coolant temp sender
+// X: resistance in ohms
+// Y: temperature in kelvin
+// ============================================================================
+
+static const size_t RESISTANCE_POINTS = 15;
+
+static const float COOLANT_X[RESISTANCE_POINTS] = {
+    20.0f,   // -> 410.00 K
+    29.6f,   // -> 394.26 K
+    40.0f,   // -> 373.15 K
+    55.0f,   // -> 363.15 K
+    70.0f,   // -> 353.15 K
+    100.0f,  // -> 343.15 K
+    112.0f,  // -> 345.37 K
+    131.0f,  // -> 337.04 K
+    140.0f,  // -> 333.15 K
+    207.0f,  // -> 327.04 K
+    300.0f,  // -> 317.15 K
+    400.0f,  // -> 313.15 K
+    450.0f,  // -> 310.93 K
+    750.0f,  // -> 288.15 K
+    900.0f   // -> 273.00 K
 };
 
-static const float COOLANT_Y[] = {
-  410.00, 394.26, 373.15, 363.15, 353.15, 343.15,
-  345.37, 337.04, 333.15, 327.04, 317.15,
-  313.15, 310.93, 288.15, 273.00
+static const float COOLANT_Y[RESISTANCE_POINTS] = {
+    410.00f, // at 20.0 Ω
+    394.26f, // at 29.6 Ω
+    373.15f, // at 40.0 Ω
+    363.15f, // at 55.0 Ω
+    353.15f, // at 70.0 Ω
+    343.15f, // at 100.0 Ω
+    345.37f, // at 112.0 Ω
+    337.04f, // at 131.0 Ω
+    333.15f, // at 140.0 Ω
+    327.04f, // at 207.0 Ω
+    317.15f, // at 300.0 Ω
+    313.15f, // at 400.0 Ω
+    310.93f, // at 450.0 Ω
+    288.15f, // at 750.0 Ω
+    273.00f  // at 900.0 Ω
 };
 
 class CoolantTempLookup : public Transform<float, float> {
@@ -156,25 +202,39 @@ class CoolantTempLookup : public Transform<float, float> {
 
 // ============================================================================
 // EXACT ORIGINAL FUEL CURVE (RPM → m³/h)
+// Fuel consumption lookup table for Yanmar 3YM30 engine with 17x13 propeller
+// on a 22 000 lb sailboat at various RPMs. Your values WILL be different.
+// Recommend reccording consumtion at 2000 RPM and cruising RPM (2700-2000)
+// to calibrate for your engine/propeller/boat combination.
 // ============================================================================
 
-static const float FUEL_X[] = {
-  500, 1000, 1500, 1800, 2000,
-  2200, 2400, 2600, 2800, 3000
+static const size_t FUEL_POINTS = 14;
+
+static const float FUEL_X[FUEL_POINTS] = {
+  500.0f, 1000.0f, 1500.0f, 2000.0f,
+  2200.0f, 2400.0f, 2600.0f, 2800.0f,
+  3000.0f, 3200.0f, 3400.0f, 3600.0f,
+  3800.0f, 3900.0f
 };
 
-static const float FUEL_Y[] = {
-  0.00080f/1000.0f,
-  0.00140f/1000.0f,
-  0.00220f/1000.0f,
-  0.00300f/1000.0f,
-  0.00380f/1000.0f,
-  0.00450f/1000.0f,
-  0.00530f/1000.0f,
-  0.00620f/1000.0f,
-  0.00720f/1000.0f,
-  0.00830f/1000.0f
+// Fuel flow in m³/h, 100% accurate at 2800 RPM (cruising RPM)
+static const float FUEL_Y[FUEL_POINTS] = {
+  0.000792f,  // 500
+  0.000800f,  // 1000
+  0.001116f,  // 1500
+  0.001296f,  // 2000
+  0.001692f,  // 2200
+  0.002016f,  // 2400
+  0.002304f,  // 2600
+  0.002700f,  // 2800
+  0.002988f,  // 3000
+  0.003996f,  // 3200
+  0.005004f,  // 3400
+  0.006012f,  // 3600
+  0.006984f,  // 3800
+  0.007200f   // 3900
 };
+
 
 class FuelLookup : public Transform<float, float> {
  public:
