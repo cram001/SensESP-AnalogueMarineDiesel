@@ -3,127 +3,127 @@
 // ANALOGUE DIESEL ENGINE MONITOR — ESP32 + SensESP 3.x
 // ============================================================================
 // Features:
-//   • Coolant temp via Teleflex/Faria 240–33Ω sender (ADC → volts → Ω → K)
-//   • Up to 3 × DS18B20 sensors (OneWire v3.x, SensESP)
-//   • Engine RPM via magnetic pickup ISR + RepeatSensor<float>
-//   • Fuel burn estimation via CurveInterpolator + smoothing
-//   • Automatic publishing to Signal K
-//   • OTA update page at /ota
-//   • OTA rollback protection
-//
-// Developer Notes:
-//   • Designed for SensESP 3.x — NOT compatible with 2.x.
-//   • RepeatSensor<T> returns values, Transform<T> emits values.
-//   • Avoid floating point in ISR. Keep it tiny.
+//   • Coolant temp (ADC → V → Ω → K → Signal K)
+//   • 3 × DS18B20 OneWire sensors
+//   • RPM via magnetic pickup ISR + RepeatSensor<float>
+//   • Fuel burn estimation + EMA smoothing
+//   • Engine hours accumulator (stored, persists)
+//   • OTA upload page (/) + rollback protection
 // ============================================================================
 
 #include <Arduino.h>
 
-// ---------------------------------------------------------------------------
 // SensESP Core
-// ---------------------------------------------------------------------------
 #include "sensesp.h"
 #include "sensesp_app_builder.h"
 #include "sensesp/system/filesystem.h"
 
-// Transforms / Outputs
+// Sensors / transforms
 #include "sensesp/sensors/sensor.h"
 #include "sensesp/transforms/curveinterpolator.h"
 #include "sensesp/transforms/ema.h"
 #include "sensesp/transforms/moving_average.h"
 #include "sensesp/signalk/signalk_output.h"
 
-// Analog Input
-#include "sensesp/sensors/analog_input.h"
-
 // OneWire subsystem
 #include "sensesp_onewire/onewire_temperature.h"
 
-// ESP32 ADC calibration
+// Persistent values
+#include "sensesp/system/observablevalue.h"
+
+// ESP32 calibration
 #include "esp_adc_cal.h"
 
-// OTA support
+// OTA
 #include <WebServer.h>
+#include <Update.h>
 #include "esp_ota_ops.h"
 
+using namespace sensesp;
 
-// ============================================================================
+// ---------------------------------------------------------------------------
 // GLOBALS
-// ============================================================================
-std::shared_ptr<sensesp::SensESPApp> sensesp_app;
+// ---------------------------------------------------------------------------
+
+// Use SensESP's official global
+// extern std::shared_ptr<SensESPApp> sensesp::sensesp_app;
+
 WebServer ota_server(80);
 
+// Engine hours persistent (stored)
+std::shared_ptr<PersistingObservableValue<float>> engine_hours;
 
-// ============================================================================
+static float g_last_rpm = 0.0f;
+
+// ---------------------------------------------------------------------------
 // HARDWARE CONSTANTS
-// ============================================================================
+// ---------------------------------------------------------------------------
 static const uint8_t COOLANT_ADC_PIN = 34;
 static const uint8_t ONE_WIRE_PIN    = 4;
 static const uint8_t RPM_INPUT_PIN   = 33;
 
 static const uint16_t RING_GEAR_TEETH = 116;
 
-
 // ============================================================================
-// CALIBRATED ADC SENSOR (returns Volts)
+// ADC SENSOR (Calibrated)
 // ============================================================================
-class CalibratedADC : public sensesp::RepeatSensor<float> {
+class CalibratedADC : public RepeatSensor<float> {
  public:
-  int adc_pin;
-  esp_adc_cal_characteristics_t cal;
+  int pin_;
+  esp_adc_cal_characteristics_t cal_;
 
-  CalibratedADC(int adc_pin, uint32_t interval_ms)
-      : adc_pin(adc_pin),
-        sensesp::RepeatSensor<float>(
+  CalibratedADC(int pin, uint32_t interval_ms)
+      : pin_(pin),
+        RepeatSensor<float>(
             interval_ms,
             [this]() -> float {
-              uint32_t raw = analogRead(this->adc_pin);
-              uint32_t mv  = esp_adc_cal_raw_to_voltage(raw, &this->cal);
-              return mv / 1000.0f;  // mV → V
+              uint32_t raw = analogRead(this->pin_);
+              uint32_t mv = esp_adc_cal_raw_to_voltage(raw, &this->cal_);
+              return mv / 1000.0f;
             }) 
   {
     analogReadResolution(12);
-    analogSetPinAttenuation(adc_pin, ADC_11db);
+    analogSetPinAttenuation(pin_, ADC_11db);
 
     esp_adc_cal_characterize(
         ADC_UNIT_1,
         ADC_ATTEN_DB_11,
         ADC_WIDTH_BIT_12,
-        1100,   // mV reference
-        &cal);
+        1100,
+        &cal_);
   }
 };
 
-
 // ============================================================================
-// VOLTAGE → RESISTANCE (Thermistor divider conversion)
+// VOLTAGE → RESISTANCE (Thermistor divider)
 // ============================================================================
-class VoltageToResistance : public sensesp::Transform<float, float> {
+class VoltageToResistance : public Transform<float, float> {
  public:
-  float r_fixed = 100000.0f; // 100k resistor
+  float R_fixed = 100000.0f;
 
-  VoltageToResistance() : sensesp::Transform<float, float>("volt2res") {}
+  VoltageToResistance() : Transform<float, float>("volt2res") {}
 
   void set(const float& v_adc) override {
+
     if (v_adc < 0.02f || v_adc > 3.25f) {
       emit(NAN);
       return;
     }
-    const float vs = 3.3f;
-    float rs = (r_fixed * (vs / v_adc)) - r_fixed;
-    emit(rs);
+
+    const float V_supply = 3.3f;
+    float R_sender = (R_fixed * (V_supply / v_adc)) - R_fixed;
+    emit(R_sender);
   }
 };
 
-
 // ============================================================================
-// TEMPERATURE CURVE (Ω → K)
+// THERMISTOR CURVE (Ω → Kelvin)
 // ============================================================================
-class TemperatureUSInterpreter : public sensesp::CurveInterpolator {
+class TemperatureUSInterpreter : public CurveInterpolator {
  public:
   TemperatureUSInterpreter(String path = "")
-      : sensesp::CurveInterpolator(NULL, path) 
-  {
+      : CurveInterpolator(NULL, path) {
+
     clear_samples();
 
     add_sample({20,  410.00});
@@ -144,40 +144,34 @@ class TemperatureUSInterpreter : public sensesp::CurveInterpolator {
   }
 };
 
-
 // ============================================================================
-// FUEL BURN CURVE (RPM → m³/s) + smoothing added later
+// FUEL INTERPOLATOR (RPM → m³/h)
 // ============================================================================
-class FuelInterpreter : public sensesp::CurveInterpolator {
+class FuelInterpreter : public CurveInterpolator {
  public:
   FuelInterpreter(String path = "")
-      : sensesp::CurveInterpolator(NULL, path)
+      : CurveInterpolator(NULL, path) 
   {
     clear_samples();
 
-    add_sample({500,  0.00000022});
-    add_sample({1000, 0.00000022});
-    add_sample({1500, 0.00000031});
-    add_sample({1800, 0.00000036});
-    add_sample({2000, 0.00000047});
-    add_sample({2200, 0.00000056});
-    add_sample({2400, 0.00000064});
-    add_sample({2600, 0.00000075});
-    add_sample({2800, 0.00000083});
-    add_sample({3000, 0.00000111});
-    add_sample({3200, 0.00000139});
-    add_sample({3400, 0.00000167});
-    add_sample({3800, 0.00000194});
-    add_sample({3900, 0.00000200});
+    add_sample({500,  0.00080f / 1000.0f});
+    add_sample({1000, 0.00140f / 1000.0f});
+    add_sample({1500, 0.00220f / 1000.0f});
+    add_sample({1800, 0.00300f / 1000.0f});
+    add_sample({2000, 0.00380f / 1000.0f});
+    add_sample({2200, 0.00450f / 1000.0f});
+    add_sample({2400, 0.00530f / 1000.0f});
+    add_sample({2600, 0.00620f / 1000.0f});
+    add_sample({2800, 0.00720f / 1000.0f});
+    add_sample({3000, 0.00830f / 1000.0f});
   }
 };
 
-
 // ============================================================================
-// RPM READING VIA ISR + RepeatSensor<float>
+// RPM ISR + SENSOR
 // ============================================================================
 volatile uint32_t rpm_pulses = 0;
-volatile uint32_t last_us = 0;
+volatile uint32_t last_us    = 0;
 
 void IRAM_ATTR rpm_isr() {
   uint32_t now = micros();
@@ -187,28 +181,41 @@ void IRAM_ATTR rpm_isr() {
   }
 }
 
-class RPMCalc : public sensesp::RepeatSensor<float> {
+class RPMCalc : public RepeatSensor<float> {
  public:
-  uint32_t interval_ms;
+  const uint32_t interval_ms_;
 
   RPMCalc(uint32_t interval_ms)
-      : interval_ms(interval_ms),
-        sensesp::RepeatSensor<float>(
+      : interval_ms_(interval_ms),
+        RepeatSensor<float>(
             interval_ms,
-            [this, interval_ms]() -> float {
+            [this]() -> float {
               uint32_t p = rpm_pulses;
               rpm_pulses = 0;
 
               float revs = float(p) / float(RING_GEAR_TEETH);
-              float rpm = (revs / (float(interval_ms) / 1000.0f)) * 60.0f;
+              float rpm = (revs / (interval_ms_ / 1000.0f)) * 60.0f;
 
+              g_last_rpm = rpm;
               return rpm;
             }) {}
 };
 
+// ============================================================================
+// Round to 1 decimal
+// ============================================================================
+class Round1Decimal : public Transform<float, float> {
+ public:
+  Round1Decimal() : Transform<float, float>("round1") {}
+
+  void set(const float& v) override {
+    float r = roundf(v * 10.0f) / 10.0f;
+    emit(r);
+  }
+};
 
 // ============================================================================
-// COOLANT SENSOR SETUP
+// COOLANT CHAIN
 // ============================================================================
 void setup_coolant() {
 
@@ -216,127 +223,158 @@ void setup_coolant() {
   auto v2r   = std::make_shared<VoltageToResistance>();
   auto curve = std::make_shared<TemperatureUSInterpreter>();
 
-  auto sk = std::make_shared<sensesp::SKOutputFloat>(
+  auto sk = std::make_shared<SKOutputFloat>(
       "propulsion.engine.coolantTemperature",
       "/Engine/CoolantTemperature");
 
-  adc->connect_to(v2r)->connect_to(curve)->connect_to(sk);
+  adc->connect_to(v2r)
+     ->connect_to(curve)
+     ->connect_to(sk);
 }
 
-
 // ============================================================================
-// ONEWIRE TEMP SETUP (3 sensors)
+// ONEWIRE
 // ============================================================================
 void setup_onewire() {
 
-  auto* dts = new sensesp::onewire::DallasTemperatureSensors(ONE_WIRE_PIN);
-  uint read_delay = 1000;
+  auto* dts = new onewire::DallasTemperatureSensors(ONE_WIRE_PIN);
 
   for (int i = 1; i <= 3; i++) {
-    String path = "/OneWire/S" + String(i);
+    String idx  = String(i);
+    String base = "/OneWire/S" + idx;
 
-    auto t  = new sensesp::onewire::OneWireTemperature(dts, read_delay, path);
-    auto sk = new sensesp::SKOutputFloat(
-        "environment.sensors.onewire." + String(i),
-        path + "/SK");
+    auto t  = new onewire::OneWireTemperature(dts, 1000, base);
+    auto sk = new SKOutputFloat(
+        "environment.sensors.onewire." + idx,
+        base + "/SK");
 
     t->connect_to(sk);
   }
 }
 
-
 // ============================================================================
-// RPM + FUEL OUTPUT SETUP
+// RPM + Fuel + Engine Hours
 // ============================================================================
-void setup_rpm() {
+void setup_rpm_and_fuel() {
 
   pinMode(RPM_INPUT_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(RPM_INPUT_PIN), rpm_isr, RISING);
 
-  auto rpm = std::make_shared<RPMCalc>(100);
-  auto ema = std::make_shared<sensesp::EMA>(0.3);
+  auto rpm_sensor = std::make_shared<RPMCalc>(100);
+  auto rpm_smooth = std::make_shared<EMA>(0.3f);
 
-  auto skrpm = std::make_shared<sensesp::SKOutputFloat>(
+  auto rpm_out = std::make_shared<SKOutputFloat>(
       "propulsion.engine.revolutions",
       "/Engine/RPM");
 
-  rpm->connect_to(ema)->connect_to(skrpm);
+  rpm_sensor->connect_to(rpm_smooth)->connect_to(rpm_out);
 
-  auto fuel         = std::make_shared<FuelInterpreter>();
-  auto fuel_smooth  = std::make_shared<sensesp::EMA>(0.2);    // fuel smoothing
-  auto skfuel       = std::make_shared<sensesp::SKOutputFloat>(
+  auto fuel_curve  = std::make_shared<FuelInterpreter>();
+  auto fuel_smooth = std::make_shared<EMA>(0.2f);
+  auto fuel_out    = std::make_shared<SKOutputFloat>(
       "propulsion.engine.fuel.rate",
       "/Engine/FuelRate");
 
-  rpm->connect_to(fuel)->connect_to(fuel_smooth)->connect_to(skfuel);
+  rpm_sensor->connect_to(fuel_curve)
+            ->connect_to(fuel_smooth)
+            ->connect_to(fuel_out);
+
+  // Engine hour accumulation
+  event_loop()->onRepeat(1000, []() {
+    if (g_last_rpm > 500.0f) {
+      float val = engine_hours->get();
+      engine_hours->set(val + 1.0f / 3600.0f);
+    }
+  });
+
+  // Save to flash every 30 seconds
+  event_loop()->onRepeat(30000, []() {
+    engine_hours->save();
+  });
+
+  auto rounder = std::make_shared<Round1Decimal>();
+  auto eh_out  = std::make_shared<SKOutputNumeric<float>>(
+      "propulsion.engine.runTime",
+      "/Engine/Hours");
+
+  engine_hours->connect_to(rounder)->connect_to(eh_out);
 }
 
-
 // ============================================================================
-// BUILD ALL SUBSYSTEMS
+// BUILD SYSTEM
 // ============================================================================
 void build_system() {
   setup_coolant();
   setup_onewire();
-  setup_rpm();
+  setup_rpm_and_fuel();
 }
 
-
 // ============================================================================
-// OTA WEB UI
+// OTA
 // ============================================================================
 void setup_ota_web() {
 
   ota_server.on("/", HTTP_GET, []() {
     ota_server.send(200, "text/html",
-      "<h2>Engine Monitor OTA Update</h2>"
-      "<form method='POST' action='/update' enctype='multipart/form-data'>"
-      "<input type='file' name='firmware'/>"
-      "<input type='submit' value='Update Firmware'/>"
+      "<h2>Engine Monitor OTA</h2>"
+      "<form method='POST' enctype='multipart/form-data' action='/update'>"
+      "<input type='file' name='firmware'>"
+      "<input type='submit' value='Upload'>"
       "</form>");
   });
 
-  ota_server.on("/update", HTTP_POST,
-    []() {
-      bool ok = !Update.hasError();
-      ota_server.send(200, "text/plain", ok ? "OK" : "FAIL");
-      delay(500);
-      if (ok) ESP.restart();
-    },
-    []() {
-      HTTPUpload& up = ota_server.upload();
-      if (up.status == UPLOAD_FILE_START) Update.begin();
-      else if (up.status == UPLOAD_FILE_WRITE) Update.write(up.buf, up.currentSize);
-      else if (up.status == UPLOAD_FILE_END) Update.end(true);
-    });
+  ota_server.on(
+      "/update",
+      HTTP_POST,
+      []() {
+        bool ok = !Update.hasError();
+        ota_server.send(200, "text/plain", ok ? "OK" : "FAIL");
+        delay(300);
+        if (ok) ESP.restart();
+      },
+      []() {
+        HTTPUpload& u = ota_server.upload();
+        if (u.status == UPLOAD_FILE_START) {
+          Update.begin();
+        } else if (u.status == UPLOAD_FILE_WRITE) {
+          Update.write(u.buf, u.currentSize);
+        } else if (u.status == UPLOAD_FILE_END) {
+          Update.end(true);
+        }
+      });
 
   ota_server.begin();
 }
 
-
 // ============================================================================
-// MAIN SETUP
+// SETUP
 // ============================================================================
 void setup() {
 
-  sensesp::SensESPAppBuilder builder;
+  SensESPAppBuilder builder;
   builder.set_hostname("engine-monitor");
 
-  sensesp_app = builder.get_app();
+  // IMPORTANT: use SensESP's global instance
+  sensesp::sensesp_app = builder.get_app();
 
-  build_system();      // initialize sensors/transforms
-  setup_ota_web();     // start OTA
-  sensesp_app->start();
+  // Persistent engine hours (2 decimal internal resolution)
+  engine_hours = std::make_shared<PersistingObservableValue<float>>(
+      0.0f, "/engine/hours");
 
-  // OTA rollback protection
+  engine_hours->load();
+
+  build_system();
+  setup_ota_web();
+
+  sensesp::sensesp_app->start();
+
   esp_ota_mark_app_valid_cancel_rollback();
 }
 
-
 // ============================================================================
-// MAIN LOOP
+// LOOP
 // ============================================================================
 void loop() {
-  sensesp::event_loop()->tick();
+  event_loop()->tick();
   ota_server.handleClient();
 }
