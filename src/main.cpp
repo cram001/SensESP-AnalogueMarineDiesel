@@ -234,72 +234,94 @@ void setup_onewire() {
 
   const uint32_t read_delay = 1000;
 
-  // ───────────────────────────────────────────────
+  // -------------------------------------------------------
   // SENSOR 1 — GPIO 4
-  // ───────────────────────────────────────────────
+  // -------------------------------------------------------
   {
-    auto* dts1 = new DallasTemperatureSensors(4);  // OneWire bus on GPIO4
+    auto* dts1 = new DallasTemperatureSensors(4);
+    dts1->update_sensors();
 
-    String base1 = "/OneWire/S1";
+    if (dts1->get_sensor_count() > 0) {
 
-    auto* t1 = new OneWireTemperature(
-        dts1,
-        read_delay,
-        base1
-    );
+      String base1 = "/OneWire/S1";
 
-    auto* sk1 = new SKOutputFloat(
-        "environment.sensors.onewire.1",
-        base1 + "/SK"
-    );
+      auto* t1 = new OneWireTemperature(
+          dts1,
+          read_delay,
+          base1
+      );
 
-    t1->connect_to(sk1);
+      auto* sk1 = new SKOutputFloat(
+          "environment.sensors.onewire.1",
+          base1 + "/SK"
+      );
+
+      t1->connect_to(sk1);
+      Serial.println("OneWire S1 detected.");
+    } else {
+      Serial.println("OneWire S1 missing → sensor skipped.");
+    }
   }
 
-  // ───────────────────────────────────────────────
+  // -------------------------------------------------------
   // SENSOR 2 — GPIO 16
-  // ───────────────────────────────────────────────
+  // -------------------------------------------------------
   {
-    auto* dts2 = new DallasTemperatureSensors(16); // OneWire bus on GPIO16
+    auto* dts2 = new DallasTemperatureSensors(16);
+    dts2->update_sensors();
 
-    String base2 = "/OneWire/S2";
+    if (dts2->get_sensor_count() > 0) {
 
-    auto* t2 = new OneWireTemperature(
-        dts2,
-        read_delay,
-        base2
-    );
+      String base2 = "/OneWire/S2";
 
-    auto* sk2 = new SKOutputFloat(
-        "environment.sensors.onewire.2",
-        base2 + "/SK"
-    );
+      auto* t2 = new OneWireTemperature(
+          dts2,
+          read_delay,
+          base2
+      );
 
-    t2->connect_to(sk2);
+      auto* sk2 = new SKOutputFloat(
+          "environment.sensors.onewire.2",
+          base2 + "/SK"
+      );
+
+      t2->connect_to(sk2);
+      Serial.println("OneWire S2 detected.");
+    } else {
+      Serial.println("OneWire S2 missing → sensor skipped.");
+    }
   }
-
-  // ───────────────────────────────────────────────
+ 
+  // -------------------------------------------------------
   // SENSOR 3 — GPIO 17
-  // ───────────────────────────────────────────────
+  // -------------------------------------------------------
   {
-    auto* dts3 = new DallasTemperatureSensors(17); // OneWire bus on GPIO17
+    auto* dts3 = new DallasTemperatureSensors(17);
+    dts3->update_sensors();
 
-    String base3 = "/OneWire/S3";
+    if (dts3->get_sensor_count() > 0) {
 
-    auto* t3 = new OneWireTemperature(
-        dts3,
-        read_delay,
-        base3
-    );
+      String base3 = "/OneWire/S3";
 
-    auto* sk3 = new SKOutputFloat(
-        "environment.sensors.onewire.3",
-        base3 + "/SK"
-    );
+      auto* t3 = new OneWireTemperature(
+          dts3,
+          read_delay,
+          base3
+      );
 
-    t3->connect_to(sk3);
+      auto* sk3 = new SKOutputFloat(
+          "environment.sensors.onewire.3",
+          base3 + "/SK"
+      );
+
+      t3->connect_to(sk3);
+      Serial.println("OneWire S3 detected.");
+    } else {
+      Serial.println("OneWire S3 missing → sensor skipped.");
+    }
   }
 }
+
 
 
 // ============================================================================
