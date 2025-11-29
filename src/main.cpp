@@ -3,7 +3,7 @@
 // ANALOGUE DIESEL ENGINE MONITOR — ESP32 + SensESP 3.x
 // ============================================================================
 // Features:
-//   • Coolant temp via Teleflex/Faria 240–33Ω sender (ADC → volts → Ω → K)
+//   • Coolant temp via Teleflex/Faria 450–30Ω sender (ADC → volts → Ω → K)
 //   • Up to 3 × DS18B20 sensors (OneWire v3.x, SensESP)
 //   • Engine RPM via magnetic pickup ISR + RepeatSensor<float>
 //   • Fuel burn estimation via CurveInterpolator + smoothing
