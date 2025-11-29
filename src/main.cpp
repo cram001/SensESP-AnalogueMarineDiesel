@@ -1,7 +1,7 @@
 //
 // ============================================================================
 // ANALOGUE DIESEL ENGINE MONITOR — ESP32 + SensESP 3.1.1
-// MAX = 3 OneWire DS18B20 sensors (boot-time detection only, no hot-plug)
+// MAX = 3 OneWire DS18B20 sensors (boot-time detection only)
 // ============================================================================
 // Features:
 //   • Coolant temp (ADC → V → Ω → K → Signal K)
@@ -15,29 +15,29 @@
 #include <Arduino.h>
 
 // SensESP core
-#include "sensesp.h"
-#include "sensesp_app_builder.h"
-#include "sensesp/system/filesystem.h"
+#include <sensesp.h>
+#include <sensesp_app_builder.h>
+#include <sensesp/system/filesystem.h>
 
 // Sensors / transforms
-#include "sensesp/sensors/sensor.h"
-#include "sensesp/transforms/curveinterpolator.h"
-#include "sensesp/transforms/ema.h"
-#include "sensesp/signalk/signalk_output.h"
+#include <sensesp/sensors/sensor.h>
+#include <sensesp/transforms/curveinterpolator.h>
+#include <sensesp/transforms/ema.h>
+#include <sensesp/signalk/signalk_output.h>
 
-// OneWire subsystem — SensESP v3.1.1
+// SensESP OneWire module
 #include <sensesp_onewire/onewire_temperature.h>
 
 // Persistent storage
-#include "sensesp/system/observablevalue.h"
+#include <sensesp/system/observablevalue.h>
 
 // ADC calibration
-#include "esp_adc_cal.h"
+#include <esp_adc_cal.h>
 
 // OTA
 #include <WebServer.h>
 #include <Update.h>
-#include "esp_ota_ops.h"
+#include <esp_ota_ops.h>
 
 using namespace sensesp;
 using namespace sensesp::onewire;
@@ -61,7 +61,7 @@ static const uint8_t RPM_INPUT_PIN   = 33;
 static const uint16_t RING_GEAR_TEETH = 116;
 
 // ============================================================================
-// ADC CALIBRATED
+// ADC → voltage sensor
 // ============================================================================
 
 class CalibratedADC : public RepeatSensor<float> {
@@ -80,11 +80,13 @@ class CalibratedADC : public RepeatSensor<float> {
             }) {
 
     analogReadResolution(12);
-    analogSetPinAttenuation(pin_, ADC_ATTEN_DB_12);
+
+    // UNIVERSAL attenuation constant (supported across all ESP32 Arduino cores)
+    analogSetPinAttenuation(pin_, ADC_11db);
 
     esp_adc_cal_characterize(
         ADC_UNIT_1,
-        ADC_ATTEN_DB_12,
+        ADC_ATTEN_DB_11,
         ADC_WIDTH_BIT_12,
         1100,
         &cal_);
@@ -92,7 +94,7 @@ class CalibratedADC : public RepeatSensor<float> {
 };
 
 // ============================================================================
-// VOLTAGE → RESISTANCE
+// Voltage → resistance
 // ============================================================================
 
 class VoltageToResistance : public Transform<float, float> {
@@ -116,7 +118,7 @@ class VoltageToResistance : public Transform<float, float> {
 };
 
 // ============================================================================
-// COOLANT CURVE (Ω → Kelvin)
+// Coolant curve (Ω → Kelvin)
 // ============================================================================
 
 class TemperatureUSInterpreter : public CurveInterpolator {
@@ -145,7 +147,7 @@ class TemperatureUSInterpreter : public CurveInterpolator {
 };
 
 // ============================================================================
-// FUEL CURVE (RPM → m³/h)
+// Fuel curve (RPM → m³/h)
 // ============================================================================
 
 class FuelInterpreter : public CurveInterpolator {
@@ -172,7 +174,7 @@ class FuelInterpreter : public CurveInterpolator {
 };
 
 // ============================================================================
-// RPM SENSOR ISR
+// RPM sensor (ISR + calculation)
 // ============================================================================
 
 volatile uint32_t rpm_pulses = 0;
@@ -207,7 +209,7 @@ class RPMCalc : public RepeatSensor<float> {
 };
 
 // ============================================================================
-// ROUNDING
+// Round float to 0.1
 // ============================================================================
 
 class Round1Decimal : public Transform<float, float> {
@@ -236,13 +238,12 @@ void setup_coolant() {
 }
 
 // ============================================================================
-// FIXED 3-SENSOR ONEWIRE CONFIG
+// ONEWIRE — 3 fixed DS18B20 sensors
 // ============================================================================
 
 void setup_onewire() {
 
-  DallasTemperatureSensors* dts =
-      new DallasTemperatureSensors(ONE_WIRE_PIN, 3);
+  auto* dts = new DallasTemperatureSensors(ONE_WIRE_PIN);
 
   const uint32_t read_delay = 1000;
 
@@ -262,7 +263,7 @@ void setup_onewire() {
 }
 
 // ============================================================================
-// RPM + FUEL + ENGINE HOURS
+// RPM + Fuel + Engine Hours
 // ============================================================================
 
 void setup_rpm_and_fuel() {
@@ -291,12 +292,14 @@ void setup_rpm_and_fuel() {
       ->connect_to(fuel_smooth)
       ->connect_to(fuel_out);
 
+  // Engine hours running above idle (rpm > 500)
   event_loop()->onRepeat(1000, []() {
     if (engine_hours && g_last_rpm > 500.0f) {
       engine_hours->set(engine_hours->get() + 1.0f / 3600.0f);
     }
   });
 
+  // Persist engine hours
   event_loop()->onRepeat(30000, []() {
     if (engine_hours) engine_hours->save();
   });
@@ -311,7 +314,7 @@ void setup_rpm_and_fuel() {
 }
 
 // ============================================================================
-// BUILD ALL SUBSYSTEMS
+// BUILD SYSTEM
 // ============================================================================
 
 void build_system() {
@@ -321,7 +324,7 @@ void build_system() {
 }
 
 // ============================================================================
-// OTA WEB SERVER
+// OTA — Web-based firmware update
 // ============================================================================
 
 void setup_ota_web() {
@@ -372,7 +375,7 @@ void setup() {
   SensESPAppBuilder builder;
   builder.set_hostname("engine-monitor");
 
-  sensesp_app = builder.get_app();
+  sensesp::sensesp_app = builder.get_app();
 
   engine_hours = std::make_shared<PersistingObservableValue<float>>(
       0.0f, "/engine/hours");
@@ -381,7 +384,7 @@ void setup() {
   build_system();
   setup_ota_web();
 
-  sensesp_app->start();
+  sensesp::sensesp_app->start();
 
   esp_ota_mark_app_valid_cancel_rollback();
 }
