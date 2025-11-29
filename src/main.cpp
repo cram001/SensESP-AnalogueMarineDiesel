@@ -1,15 +1,7 @@
 //
 // ============================================================================
 // ANALOGUE DIESEL ENGINE MONITOR — ESP32 + SensESP 3.1.1
-// MAX = 3 OneWire DS18B20 sensors (boot-time detection only)
-// ============================================================================
-// Features:
-//   • Coolant temp (ADC → V → Ω → K → Signal K)
-//   • Up to 3 × DS18B20 OneWire sensors (non-fatal if missing)
-//   • RPM via magnetic pickup ISR
-//   • Fuel burn estimation in m³/h
-//   • Engine hours accumulator (persists across reboots)
-//   • OTA update server (port 8080)
+// AUTO-DETECT DS18B20 (0–3) WITH ROM-BASED UNIQUE SK PATHS
 // ============================================================================
 
 #include <Arduino.h>
@@ -25,7 +17,7 @@
 #include <sensesp/transforms/ema.h>
 #include <sensesp/signalk/signalk_output.h>
 
-// SensESP OneWire module
+// OneWire Subsystem
 #include <sensesp_onewire/onewire_temperature.h>
 
 // Persistent storage
@@ -45,7 +37,6 @@ using namespace sensesp::onewire;
 // ============================================================================
 // GLOBALS
 // ============================================================================
-
 extern std::shared_ptr<SensESPApp> sensesp_app;
 
 WebServer ota_server(8080);
@@ -61,9 +52,19 @@ static const uint8_t RPM_INPUT_PIN   = 33;
 static const uint16_t RING_GEAR_TEETH = 116;
 
 // ============================================================================
+// Helper: convert ROM to hex string
+// ============================================================================
+String rom_to_hex(const uint8_t* addr) {
+  char buf[17];
+  for (int i = 0; i < 8; i++) {
+    sprintf(&buf[i * 2], "%02X", addr[i]);
+  }
+  return String(buf);
+}
+
+// ============================================================================
 // ADC → voltage sensor
 // ============================================================================
-
 class CalibratedADC : public RepeatSensor<float> {
  public:
   int pin_;
@@ -80,8 +81,6 @@ class CalibratedADC : public RepeatSensor<float> {
             }) {
 
     analogReadResolution(12);
-
-    // UNIVERSAL attenuation constant (supported across all ESP32 Arduino cores)
     analogSetPinAttenuation(pin_, ADC_11db);
 
     esp_adc_cal_characterize(
@@ -96,7 +95,6 @@ class CalibratedADC : public RepeatSensor<float> {
 // ============================================================================
 // Voltage → resistance
 // ============================================================================
-
 class VoltageToResistance : public Transform<float, float> {
  public:
   float R_fixed = 100000.0f;
@@ -104,7 +102,6 @@ class VoltageToResistance : public Transform<float, float> {
   VoltageToResistance() : Transform<float, float>("volt2res") {}
 
   void set(const float& v_adc) override {
-
     if (v_adc < 0.02f || v_adc > 3.25f) {
       emit(NAN);
       return;
@@ -112,7 +109,6 @@ class VoltageToResistance : public Transform<float, float> {
 
     float V_supply = 3.3f;
     float R_sender = (R_fixed * (V_supply / v_adc)) - R_fixed;
-
     emit(R_sender);
   }
 };
@@ -120,14 +116,11 @@ class VoltageToResistance : public Transform<float, float> {
 // ============================================================================
 // Coolant curve (Ω → Kelvin)
 // ============================================================================
-
 class TemperatureUSInterpreter : public CurveInterpolator {
  public:
   TemperatureUSInterpreter(String path = "")
       : CurveInterpolator(NULL, path) {
-
     clear_samples();
-
     add_sample({20.0f,   410.00f});
     add_sample({29.6f,   394.26f});
     add_sample({40.0f,   373.15f});
@@ -149,14 +142,12 @@ class TemperatureUSInterpreter : public CurveInterpolator {
 // ============================================================================
 // Fuel curve (RPM → m³/h)
 // ============================================================================
-
 class FuelInterpreter : public CurveInterpolator {
  public:
   FuelInterpreter(String path = "")
       : CurveInterpolator(NULL, path) {
 
     clear_samples();
-
     add_sample({500,  0.0008f});
     add_sample({1000, 0.0008f});
     add_sample({1500, 0.0011f});
@@ -174,9 +165,8 @@ class FuelInterpreter : public CurveInterpolator {
 };
 
 // ============================================================================
-// RPM sensor (ISR + calculation)
+// RPM ISR + Calculator
 // ============================================================================
-
 volatile uint32_t rpm_pulses = 0;
 volatile uint32_t last_us    = 0;
 
@@ -209,9 +199,8 @@ class RPMCalc : public RepeatSensor<float> {
 };
 
 // ============================================================================
-// Round float to 0.1
+// Rounder
 // ============================================================================
-
 class Round1Decimal : public Transform<float, float> {
  public:
   Round1Decimal() : Transform<float, float>("round1") {}
@@ -223,7 +212,6 @@ class Round1Decimal : public Transform<float, float> {
 // ============================================================================
 // COOLANT SENSOR PIPELINE
 // ============================================================================
-
 void setup_coolant() {
 
   auto adc   = std::make_shared<CalibratedADC>(COOLANT_ADC_PIN, 1000);
@@ -238,34 +226,85 @@ void setup_coolant() {
 }
 
 // ============================================================================
-// ONEWIRE — 3 fixed DS18B20 sensors
+// ONEWIRE: Three sensors, one per pin (S1=GPIO4, S2=GPIO16, S3=GPIO17)
+// Fully compatible with SensESP 3.1.1 + OneWire 3.0.2
 // ============================================================================
 
 void setup_onewire() {
 
-  auto* dts = new DallasTemperatureSensors(ONE_WIRE_PIN);
-
   const uint32_t read_delay = 1000;
 
-  for (int i = 1; i <= 3; i++) {
+  // ───────────────────────────────────────────────
+  // SENSOR 1 — GPIO 4
+  // ───────────────────────────────────────────────
+  {
+    auto* dts1 = new DallasTemperatureSensors(4);  // OneWire bus on GPIO4
 
-    String idx  = String(i);
-    String base = "/OneWire/S" + idx;
+    String base1 = "/OneWire/S1";
 
-    auto* temp = new OneWireTemperature(dts, read_delay, base);
+    auto* t1 = new OneWireTemperature(
+        dts1,
+        read_delay,
+        base1
+    );
 
-    auto* sk = new SKOutputFloat(
-        "environment.sensors.onewire." + idx,
-        base + "/SK");
+    auto* sk1 = new SKOutputFloat(
+        "environment.sensors.onewire.1",
+        base1 + "/SK"
+    );
 
-    temp->connect_to(sk);
+    t1->connect_to(sk1);
+  }
+
+  // ───────────────────────────────────────────────
+  // SENSOR 2 — GPIO 16
+  // ───────────────────────────────────────────────
+  {
+    auto* dts2 = new DallasTemperatureSensors(16); // OneWire bus on GPIO16
+
+    String base2 = "/OneWire/S2";
+
+    auto* t2 = new OneWireTemperature(
+        dts2,
+        read_delay,
+        base2
+    );
+
+    auto* sk2 = new SKOutputFloat(
+        "environment.sensors.onewire.2",
+        base2 + "/SK"
+    );
+
+    t2->connect_to(sk2);
+  }
+
+  // ───────────────────────────────────────────────
+  // SENSOR 3 — GPIO 17
+  // ───────────────────────────────────────────────
+  {
+    auto* dts3 = new DallasTemperatureSensors(17); // OneWire bus on GPIO17
+
+    String base3 = "/OneWire/S3";
+
+    auto* t3 = new OneWireTemperature(
+        dts3,
+        read_delay,
+        base3
+    );
+
+    auto* sk3 = new SKOutputFloat(
+        "environment.sensors.onewire.3",
+        base3 + "/SK"
+    );
+
+    t3->connect_to(sk3);
   }
 }
 
-// ============================================================================
-// RPM + Fuel + Engine Hours
-// ============================================================================
 
+// ============================================================================
+// RPM + Fuel + Hours
+// ============================================================================
 void setup_rpm_and_fuel() {
 
   pinMode(RPM_INPUT_PIN, INPUT_PULLUP);
@@ -292,14 +331,14 @@ void setup_rpm_and_fuel() {
       ->connect_to(fuel_smooth)
       ->connect_to(fuel_out);
 
-  // Engine hours running above idle (rpm > 500)
+  // Engine hours increment
   event_loop()->onRepeat(1000, []() {
     if (engine_hours && g_last_rpm > 500.0f) {
       engine_hours->set(engine_hours->get() + 1.0f / 3600.0f);
     }
   });
 
-  // Persist engine hours
+  // Persist engine hours every 30s
   event_loop()->onRepeat(30000, []() {
     if (engine_hours) engine_hours->save();
   });
@@ -316,7 +355,6 @@ void setup_rpm_and_fuel() {
 // ============================================================================
 // BUILD SYSTEM
 // ============================================================================
-
 void build_system() {
   setup_coolant();
   setup_onewire();
@@ -324,40 +362,39 @@ void build_system() {
 }
 
 // ============================================================================
-// OTA — Web-based firmware update
+// OTA SERVER
 // ============================================================================
-
 void setup_ota_web() {
 
   ota_server.on("/", HTTP_GET, []() {
     ota_server.send(
-        200, "text/html",
-        "<h2>Engine Monitor OTA Update</h2>"
-        "<form method='POST' action='/update' enctype='multipart/form-data'>"
-        "<input type='file' name='firmware'/>"
-        "<input type='submit' value='Upload'/>"
-        "</form>");
+      200, "text/html",
+      "<h2>Engine Monitor OTA Update</h2>"
+      "<form method='POST' action='/update' enctype='multipart/form-data'>"
+      "<input type='file' name='firmware'/>"
+      "<input type='submit' value='Upload'/>"
+      "</form>");
   });
 
   ota_server.on(
-      "/update",
-      HTTP_POST,
-      []() {
-        bool ok = !Update.hasError();
-        ota_server.send(200, "text/plain", ok ? "OK" : "FAIL");
-        delay(300);
-        if (ok) ESP.restart();
-      },
-      []() {
-        HTTPUpload& u = ota_server.upload();
-        if (u.status == UPLOAD_FILE_START) {
-          Update.begin();
-        } else if (u.status == UPLOAD_FILE_WRITE) {
-          Update.write(u.buf, u.currentSize);
-        } else if (u.status == UPLOAD_FILE_END) {
-          Update.end(true);
-        }
-      });
+    "/update",
+    HTTP_POST,
+    []() {
+      bool ok = !Update.hasError();
+      ota_server.send(200, "text/plain", ok ? "OK" : "FAIL");
+      delay(300);
+      if (ok) ESP.restart();
+    },
+    []() {
+      HTTPUpload& u = ota_server.upload();
+      if (u.status == UPLOAD_FILE_START) {
+        Update.begin();
+      } else if (u.status == UPLOAD_FILE_WRITE) {
+        Update.write(u.buf, u.currentSize);
+      } else if (u.status == UPLOAD_FILE_END) {
+        Update.end(true);
+      }
+    });
 
   ota_server.begin();
 }
@@ -365,7 +402,6 @@ void setup_ota_web() {
 // ============================================================================
 // SETUP
 // ============================================================================
-
 void setup() {
 
 #ifndef SERIAL_DEBUG_DISABLED
@@ -392,7 +428,6 @@ void setup() {
 // ============================================================================
 // LOOP
 // ============================================================================
-
 void loop() {
   event_loop()->tick();
   ota_server.handleClient();
