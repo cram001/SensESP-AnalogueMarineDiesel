@@ -1,33 +1,33 @@
 //
 // ============================================================================
 // DIESEL ENGINE MONITOR — ESP32 + SensESP 3.1.1
-// Multi-bus DS18B20 auto-detect with ROM-based SK paths
+// Safe FS Init + No SK Client + Kelvin Everywhere
 // ============================================================================
 
 #include <Arduino.h>
 
-// SensESP core
+// SensESP Core
 #include <sensesp.h>
 #include <sensesp_app_builder.h>
 #include <sensesp/system/filesystem.h>
 
 // Sensors / transforms
 #include <sensesp/sensors/sensor.h>
-#include <sensesp/transforms/curveinterpolator.h>
 #include <sensesp/transforms/ema.h>
+#include <sensesp/transforms/curveinterpolator.h>
 #include <sensesp/signalk/signalk_output.h>
 
-// OneWire system
+// OneWire
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
 // Persistent
 #include <sensesp/system/observablevalue.h>
 
-// ADC calibration
+// ADC Calibration
 #include <esp_adc_cal.h>
 
-// OTA web updater
+// OTA
 #include <WebServer.h>
 #include <Update.h>
 #include <esp_ota_ops.h>
@@ -37,29 +37,52 @@ using namespace sensesp;
 // ============================================================================
 // GLOBALS
 // ============================================================================
+
 WebServer ota_server(8080);
 
 static const uint8_t COOLANT_ADC_PIN = 34;
+static const uint8_t ONE_1 = 4;
+static const uint8_t ONE_2 = 16;
+static const uint8_t ONE_3 = 17;
 
-static const uint8_t ONEWIRE_PIN_1 = 4;
-static const uint8_t ONEWIRE_PIN_2 = 16;
-static const uint8_t ONEWIRE_PIN_3 = 17;
-
-static const uint8_t RPM_INPUT_PIN = 33;
-static const uint16_t RING_GEAR_TEETH = 116;
+static const uint8_t RPM_PIN = 33;
+static const uint16_t RING_TEETH = 116;
 
 float g_last_rpm = 0.0f;
 
 std::shared_ptr<PersistingObservableValue<float>> engine_hours;
 
 // ============================================================================
-// Helper: ROM address to hex string
+// SAFE FILESYSTEM INIT (AUTO-FORMAT)
+// ============================================================================
+
+void safe_init_filesystem() {
+
+  bool mounted = Filesystem::instance()->mount();
+
+  if (!mounted) {
+    Serial.println("❗ LittleFS mount failed — formatting...");
+    Filesystem::instance()->format();
+    delay(500);
+
+    // Try again
+    if (!Filesystem::instance()->mount()) {
+      Serial.println("❗ FATAL: LittleFS mount failed after format.");
+    }
+  }
+
+  // Ensure /config exists
+  if (!Filesystem::instance()->exists("/config")) {
+    Filesystem::instance()->mkdir("/config");
+  }
+}
+
+// ============================================================================
+// ROM → Hex
 // ============================================================================
 String rom_to_hex(const uint8_t* addr) {
   char buf[17];
-  for (int i = 0; i < 8; i++) {
-    sprintf(&buf[i * 2], "%02X", addr[i]);
-  }
+  for (int i = 0; i < 8; i++) sprintf(&buf[i * 2], "%02X", addr[i]);
   return String(buf);
 }
 
@@ -71,14 +94,14 @@ class CalibratedADC : public RepeatSensor<float> {
   int pin_;
   esp_adc_cal_characteristics_t cal_;
 
-  CalibratedADC(int pin, uint32_t interval_ms)
+  CalibratedADC(int pin, uint32_t interval)
       : pin_(pin),
-        RepeatSensor<float>(interval_ms, [this]() -> float {
-          uint32_t raw = analogRead(this->pin_);
-          uint32_t mv = esp_adc_cal_raw_to_voltage(raw, &this->cal_);
-          return mv / 1000.0f;  // volts
-        }) 
-  {
+        RepeatSensor<float>(interval, [this]() -> float {
+          uint32_t raw = analogRead(pin_);
+          uint32_t mv = esp_adc_cal_raw_to_voltage(raw, &cal_);
+          return mv / 1000.0f;
+        }) {
+
     analogReadResolution(12);
     analogSetPinAttenuation(pin_, ADC_11db);
 
@@ -92,164 +115,120 @@ class CalibratedADC : public RepeatSensor<float> {
 };
 
 // ============================================================================
-// Voltage → Resistance transform
+// Voltage → Resistance
 // ============================================================================
 class VoltageToResistance : public Transform<float, float> {
  public:
-  float R_fixed = 100000.0f;
+  float Rf = 100000.0f;
 
-  VoltageToResistance() : Transform<float, float>("volt2res") {}
+  VoltageToResistance() : Transform<float, float>("V2R") {}
 
-  void set(const float& v_adc) override {
-    if (v_adc < 0.02f || v_adc > 3.25f) {
+  void set(const float& Vadc) override {
+    if (Vadc < 0.02f || Vadc > 3.25f) {
       emit(NAN);
       return;
     }
-
-    float V_supply = 3.3f;
-    float R_sender = (R_fixed * (V_supply / v_adc)) - R_fixed;
-
-    emit(R_sender);
+    float R = (Rf * (3.3f / Vadc)) - Rf;
+    emit(R);
   }
 };
 
 // ============================================================================
-// Coolant temperature curve
+// Coolant Curve (Faria/Teleflex US)
 // ============================================================================
-class TemperatureUSInterpreter : public CurveInterpolator {
+class TempInterpreter : public CurveInterpolator {
  public:
-  TemperatureUSInterpreter(String path = "")
-      : CurveInterpolator(nullptr, path) {
-
+  TempInterpreter() : CurveInterpolator(nullptr, "") {
     clear_samples();
-
-    add_sample({20.0f, 410.00f});
-    add_sample({29.6f, 394.26f});
+    add_sample({20.0f, 410.0f});
     add_sample({40.0f, 373.15f});
-    add_sample({55.0f, 363.15f});
     add_sample({70.0f, 353.15f});
     add_sample({100.0f, 343.15f});
-    add_sample({112.0f, 345.37f});
-    add_sample({131.0f, 337.04f});
     add_sample({140.0f, 333.15f});
-    add_sample({207.0f, 327.04f});
     add_sample({300.0f, 317.15f});
     add_sample({400.0f, 313.15f});
-    add_sample({450.0f, 310.93f});
     add_sample({750.0f, 288.15f});
-    add_sample({900.0f, 273.00f});
   }
 };
 
 // ============================================================================
-// Fuel curve (RPM → m³/h)
-// ============================================================================
-class FuelInterpreter : public CurveInterpolator {
- public:
-  FuelInterpreter(String path = "")
-      : CurveInterpolator(nullptr, path) {
-
-    clear_samples();
-    add_sample({500, 0.0008f});
-    add_sample({1000, 0.0008f});
-    add_sample({1500, 0.0011f});
-    add_sample({2000, 0.0013f});
-    add_sample({2200, 0.0017f});
-    add_sample({2400, 0.0020f});
-    add_sample({2600, 0.0023f});
-    add_sample({2800, 0.0027f});
-    add_sample({3000, 0.0030f});
-    add_sample({3200, 0.0040f});
-    add_sample({3400, 0.0050f});
-    add_sample({3600, 0.0060f});
-    add_sample({3800, 0.0070f});
-  }
-};
-
-// ============================================================================
-// RPM ISR
-// ============================================================================
-volatile uint32_t rpm_pulses = 0;
-volatile uint32_t last_us = 0;
-
-void IRAM_ATTR rpm_isr() {
-  uint32_t now = micros();
-  if (now - last_us > 75) {
-    rpm_pulses++;
-    last_us = now;
-  }
-}
-
-class RPMCalc : public RepeatSensor<float> {
- public:
-  uint32_t interval_ms_;
-
-  RPMCalc(uint32_t interval_ms)
-      : interval_ms_(interval_ms),
-        RepeatSensor<float>(interval_ms, [this]() -> float {
-
-          uint32_t p = rpm_pulses;
-          rpm_pulses = 0;
-
-          float revs = float(p) / float(RING_GEAR_TEETH);
-          float rpm = (revs / (interval_ms_ / 1000.0f)) * 60.0f;
-
-          g_last_rpm = rpm;
-          return rpm;
-        }) {}
-};
-
-// ============================================================================
-// Rounder (1 decimal)
-// ============================================================================
-class Round1Decimal : public Transform<float, float> {
- public:
-  Round1Decimal() : Transform<float, float>("round1") {}
-  void set(const float& v) override { emit(roundf(v * 10.0f) / 10.0f); }
-};
-
-// ============================================================================
-// COOLANT SENSOR SETUP
-// ============================================================================
-void setup_coolant() {
-
-  auto adc = std::make_shared<CalibratedADC>(COOLANT_ADC_PIN, 1000);
-  auto v2r = std::make_shared<VoltageToResistance>();
-  auto curve = std::make_shared<TemperatureUSInterpreter>();
-
-  auto sk = std::make_shared<SKOutputNumeric<float>>(
-      "propulsion.engine.coolantTemperature",
-      "/Engine/CoolantTemperature");
-
-  sk->set_metadata(new SKMetadata("K"));
-
-  adc->connect_to(v2r)->connect_to(curve)->connect_to(sk);
-}
-
-// ============================================================================
-// DS18B20 SENSOR (RepeatSensor<float> wrapper)
+// DS18B20 Sensor Wrapper
 // ============================================================================
 class DS18Sensor : public RepeatSensor<float> {
  public:
   DallasTemperature* dt_;
   DeviceAddress addr_;
 
-  DS18Sensor(DallasTemperature* dt, const uint8_t* rom, uint32_t read_delay)
-      : RepeatSensor<float>(
-            read_delay,
-            [this]() -> float {
-              dt_->requestTemperatures();
-              float tC = dt_->getTempC(addr_);
-              if (tC > -100 && tC < 200) return tC;
-              return NAN;
-            }),
+  DS18Sensor(DallasTemperature* dt, const uint8_t* rom)
+      : RepeatSensor<float>(1000, [this]() -> float {
+          dt_->requestTemperatures();
+          float t = dt_->getTempC(addr_);
+          return (t > -100 && t < 200) ? (t + 273.15f) : NAN;
+        }),
         dt_(dt) {
     memcpy(addr_, rom, 8);
   }
 };
 
 // ============================================================================
-// Configure a single OneWire bus
+// RPM ISR
+// ============================================================================
+volatile uint32_t pulses = 0;
+volatile uint32_t last_us = 0;
+
+void IRAM_ATTR rpm_isr() {
+  uint32_t now = micros();
+  if (now - last_us > 75) {
+    pulses++;
+    last_us = now;
+  }
+}
+
+class RPMCalc : public RepeatSensor<float> {
+ public:
+  uint32_t int_ms_;
+
+  RPMCalc(uint32_t ms)
+      : int_ms_(ms),
+        RepeatSensor<float>(ms, [this]() -> float {
+          uint32_t p = pulses;
+          pulses = 0;
+          float revs = float(p) / float(RING_TEETH);
+          float rpm = (revs / (int_ms_ / 1000.0f)) * 60.0f;
+          g_last_rpm = rpm;
+          return rpm;
+        }) {}
+};
+
+// ============================================================================
+// Rounder
+// ============================================================================
+class Round1 : public Transform<float, float> {
+ public:
+  Round1() : Transform<float, float>("R1") {}
+  void set(const float& v) override { emit(roundf(v * 10.0f) / 10.0f); }
+};
+
+// ============================================================================
+// SETUP COOLANT
+// ============================================================================
+void setup_coolant() {
+
+  auto adc = std::make_shared<CalibratedADC>(COOLANT_ADC_PIN, 1000);
+  auto v2r = std::make_shared<VoltageToResistance>();
+  auto cur = std::make_shared<TempInterpreter>();
+
+  auto sk = std::make_shared<SKOutputNumeric<float>>(
+      "propulsion.engine.coolantTemperature",
+      "/Engine/CoolantTemp/SK");
+
+  sk->set_metadata(new SKMetadata("K"));
+
+  adc->connect_to(v2r)->connect_to(cur)->connect_to(sk);
+}
+
+// ============================================================================
+// SETUP ONEWIRE BUS
 // ============================================================================
 void configure_bus(uint8_t pin) {
 
@@ -257,108 +236,83 @@ void configure_bus(uint8_t pin) {
   dt->begin();
 
   int count = dt->getDeviceCount();
+  Serial.printf("Bus GPIO %u: %d devices\n", pin, count);
 
-  if (count == 0) {
-    Serial.printf("No DS18B20 sensors found on GPIO %u\n", pin);
-    return;
-  }
-
-  Serial.printf("%d sensor(s) on GPIO %u\n", count, pin);
-
-  DeviceAddress addr;
+  DevicAddress addr;
 
   for (int i = 0; i < count; i++) {
 
     if (!dt->getAddress(addr, i)) continue;
 
     String rom = rom_to_hex(addr);
-    Serial.printf("ROM[%d]: %s\n", i, rom.c_str());
 
-    auto* temp = new DS18Sensor(dt, addr, 1000);
+    auto* sensor = new DS18Sensor(dt, addr);
 
     String sk_path = "environment.sensors." + rom + ".temperature";
-    String cfg_path = "/OneWire/" + rom;
+    String cfg = "/OneWire/" + rom;
 
-    auto* sk = new SKOutputNumeric<float>(sk_path, cfg_path + "/SK");
-    sk->set_metadata(new SKMetadata("K"));   // minimal metadata
+    auto* sk = new SKOutputNumeric<float>(sk_path, cfg + "/SK");
+    sk->set_metadata(new SKMetadata("K"));
 
-    temp->connect_to(sk);
+    sensor->connect_to(sk);
   }
 }
 
 void setup_onewire() {
-  configure_bus(ONEWIRE_PIN_1);
-  configure_bus(ONEWIRE_PIN_2);
-  configure_bus(ONEWIRE_PIN_3);
+  configure_bus(ONE_1);
+  configure_bus(ONE_2);
+  configure_bus(ONE_3);
 }
 
 // ============================================================================
-// RPM + Fuel + Hours
+// RPM + FUEL + HOURS
 // ============================================================================
-void setup_rpm_and_fuel() {
+void setup_rpm_fuel_hours() {
 
-  pinMode(RPM_INPUT_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(RPM_INPUT_PIN), rpm_isr, RISING);
+  pinMode(RPM_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(RPM_PIN), rpm_isr, RISING);
 
-  auto rpm_sensor = std::make_shared<RPMCalc>(100);
-  auto rpm_smooth = std::make_shared<EMA>(0.3f);
+  auto rpm = std::make_shared<RPMCalc>(100);
+  auto smooth = std::make_shared<EMA>(0.3f);
 
-  auto rpm_out = std::make_shared<SKOutputNumeric<float>>(
+  auto sk_rpm = std::make_shared<SKOutputNumeric<float>>(
       "propulsion.engine.revolutions",
       "/Engine/RPM");
+  sk_rpm->set_metadata(new SKMetadata("Hz"));
 
-  rpm_out->set_metadata(new SKMetadata("Hz"));
+  rpm->connect_to(smooth)->connect_to(sk_rpm);
 
-  rpm_sensor->connect_to(rpm_smooth)->connect_to(rpm_out);
-
-  auto fuel_curve = std::make_shared<FuelInterpreter>();
-  auto fuel_smooth = std::make_shared<EMA>(0.2f);
-
-  auto fuel_out = std::make_shared<SKOutputNumeric<float>>(
-      "propulsion.engine.fuel.rate",
-      "/Engine/FuelRate");
-
-  fuel_out->set_metadata(new SKMetadata("m3/h"));
-
-  rpm_sensor
-      ->connect_to(fuel_curve)
-      ->connect_to(fuel_smooth)
-      ->connect_to(fuel_out);
-
-  // Engine hours logic
+  // engine hours
   event_loop()->onRepeat(1000, []() {
-    if (engine_hours && g_last_rpm > 500.0f) {
+    if (engine_hours && g_last_rpm > 500.0f)
       engine_hours->set(engine_hours->get() + 1.0f / 3600.0f);
-    }
   });
 
   event_loop()->onRepeat(30000, []() {
     if (engine_hours) engine_hours->save();
   });
 
-  auto rounder = std::make_shared<Round1Decimal>();
-  auto eh_out = std::make_shared<SKOutputNumeric<float>>(
+  auto rounder = std::make_shared<Round1>();
+  auto sk_hr = std::make_shared<SKOutputNumeric<float>>(
       "propulsion.engine.runTime",
       "/Engine/Hours");
+  sk_hr->set_metadata(new SKMetadata("h"));
 
-  eh_out->set_metadata(new SKMetadata("h"));
-
-  engine_hours->connect_to(rounder)->connect_to(eh_out);
+  engine_hours->connect_to(rounder)->connect_to(sk_hr);
 }
 
 // ============================================================================
-// OTA WEB SERVER
+// OTA
 // ============================================================================
-void setup_ota_web() {
+void setup_ota() {
 
   ota_server.on("/", HTTP_GET, []() {
-    ota_server.send(
-        200, "text/html",
-        "<h2>Engine Monitor OTA Update</h2>"
-        "<form method='POST' action='/update' enctype='multipart/form-data'>"
-        "<input type='file' name='firmware'/>"
-        "<input type='submit' value='Upload'/>"
-        "</form>");
+    ota_server.send(200, "text/html",
+                    "<h2>OTA Update</h2>"
+                    "<form method='POST' action='/update' enctype='multipart/form-data'>"
+                    "<input type='file' name='firmware'/>"
+                    "<input type='submit' value='Upload'/>"
+                    "</form>");
   });
 
   ota_server.on(
@@ -367,30 +321,17 @@ void setup_ota_web() {
       []() {
         bool ok = !Update.hasError();
         ota_server.send(200, "text/plain", ok ? "OK" : "FAIL");
-        delay(250);
+        delay(200);
         if (ok) ESP.restart();
       },
       []() {
         HTTPUpload& u = ota_server.upload();
-        if (u.status == UPLOAD_FILE_START) {
-          Update.begin();
-        } else if (u.status == UPLOAD_FILE_WRITE) {
-          Update.write(u.buf, u.currentSize);
-        } else if (u.status == UPLOAD_FILE_END) {
-          Update.end(true);
-        }
+        if (u.status == UPLOAD_FILE_START) Update.begin();
+        else if (u.status == UPLOAD_FILE_WRITE) Update.write(u.buf, u.currentSize);
+        else if (u.status == UPLOAD_FILE_END) Update.end(true);
       });
 
   ota_server.begin();
-}
-
-// ============================================================================
-// SYSTEM BUILD
-// ============================================================================
-void build_system() {
-  setup_coolant();
-  setup_onewire();
-  setup_rpm_and_fuel();
 }
 
 // ============================================================================
@@ -402,17 +343,26 @@ void setup() {
   SetupSerialDebug(115200);
 #endif
 
+  safe_init_filesystem();
+
   SensESPAppBuilder builder;
+
   builder.set_hostname("engine-monitor");
+  builder.set_sk_server("0.0.0.0", 3000);   // dummy but valid
+  builder.set_wifi("engine-monitor", "12345678");
 
   sensesp_app = builder.get_app();
 
-  engine_hours =
-      std::make_shared<PersistingObservableValue<float>>(0.0f, "/engine/hours");
+  engine_hours = std::make_shared<PersistingObservableValue<float>>(0.0f, "/engine/hours");
   engine_hours->load();
 
-  build_system();
-  setup_ota_web();
+  setup_coolant();
+  setup_onewire();
+  setup_rpm_fuel_hours();
+  setup_ota();
+
+  // disable WS client completely
+  sensesp_app->get_ws_client()->set_enabled(false);
 
   sensesp_app->start();
 
